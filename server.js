@@ -548,18 +548,19 @@ async function pollGateio() {
   } catch(e) { warn(`Gate.io poll error: ${e.message}`); }
 }
 
-// MEXC REST API for M1 candle close (for candle-close alerts)
-async function pollMexcCandles() {
-  for (const [sym, mSym] of Object.entries(MEXC_SYMBOLS)) {
+// Gate.io REST for M1 candle close (for candle-close alerts)
+async function pollGateioCandles() {
+  for (const [sym, gSym] of Object.entries(GATE_SYMBOLS)) {
     try {
-      const url = `https://api.mexc.com/api/v3/klines?symbol=${mSym}&interval=1m&limit=2`;
+      const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=1m&limit=2`;
       const res = await fetchJson(url);
+      // res = array of [timestamp, volume, close, high, low, open, ...]
       if (Array.isArray(res) && res.length >= 2) {
-        const prev = res[0];
+        const prev = res[0]; // first = oldest = previous closed candle
         m1Candle[sym] = {
-          high:  parseFloat(prev[2]) || 0,
-          low:   parseFloat(prev[3]) || 0,
-          close: parseFloat(prev[4]) || 0,
+          high:  parseFloat(prev[3]) || 0,
+          low:   parseFloat(prev[4]) || 0,
+          close: parseFloat(prev[2]) || 0,
         };
       }
     } catch(e) { /* skip */ }
@@ -746,7 +747,7 @@ async function processTriggeredAlert(alert, hitPrice) {
         body:    JSON.stringify({
           writes: [{
             update:     { name: docPath, fields: {} },
-            updateMask: { fieldPaths: [alertId] }
+            updateMask: { fieldPaths: [`${alertId}`] }
           }]
         })
       }
@@ -771,7 +772,7 @@ async function processTriggeredAlert(alert, hitPrice) {
               name:   docPath,
               fields: { [alertId]: { stringValue: JSON.stringify(hitAlert) } }
             },
-            updateMask: { fieldPaths: [alertId] }
+            updateMask: { fieldPaths: [`${alertId}`] }
           }]
         })
       }
@@ -946,9 +947,9 @@ async function main() {
   setInterval(pollGateio, 10000);
   pollGateio(); // immediate first poll
 
-  // Poll MEXC REST every 60 seconds for M1 candle close (candle-close alerts)
-  setInterval(pollMexcCandles, 60000);
-  pollMexcCandles();
+  // Poll Gate.io REST every 60 seconds for M1 candle close (candle-close alerts)
+  setInterval(pollGateioCandles, 60000);
+  pollGateioCandles();
 
   // Poll Yahoo Finance every 10 seconds for indices + forex
   setInterval(pollYahoo, 10000);
