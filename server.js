@@ -734,33 +734,33 @@ async function processTriggeredAlert(alert, hitPrice) {
     log(`  RTDB deleted: ${alertId}`);
   } catch(e) { warn(`  RTDB delete failed: ${e.message}`); }
 
-  // 2. Delete from Firestore active_alerts — use commit with field delete transform
+  // 2. Delete from Firestore active_alerts field
   try {
-    const token = await getAccessToken();
+    const token   = await getAccessToken();
     const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
-    await fetchJson(
+    const res2 = await fetchJson(
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
       {
         method:  'POST',
         headers: { 'Authorization': `Bearer ${token}` },
         body:    JSON.stringify({
           writes: [{
-            update: { name: docPath, fields: {} },
-            updateMask: { fieldPaths: [alertId] },
-            currentDocument: { exists: true }
+            update:     { name: docPath, fields: {} },
+            updateMask: { fieldPaths: [alertId] }
           }]
         })
       }
     );
-    log(`  Firestore active_alerts field deleted: ${alertId}`);
+    if (res2?.error) warn(`  Firestore active_alerts delete error: ${JSON.stringify(res2.error)}`);
+    else log(`  Firestore active_alerts field deleted: ${alertId}`);
   } catch(e) { warn(`  Firestore active_alerts delete failed: ${e.message}`); }
 
-  // 3. Write to Firestore history — use commit to add field to history document
+  // 3. Write to Firestore history field
   try {
     const token    = await getAccessToken();
     const hitAlert = { ...alert, triggered: true, hitAt: hitTime };
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
-    await fetchJson(
+    const res3 = await fetchJson(
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
       {
         method:  'POST',
@@ -776,7 +776,8 @@ async function processTriggeredAlert(alert, hitPrice) {
         })
       }
     );
-    log(`  Firestore history written: ${alertId}`);
+    if (res3?.error) warn(`  Firestore history write error: ${JSON.stringify(res3.error)}`);
+    else log(`  Firestore history written: ${alertId}`);
   } catch(e) { warn(`  Firestore history write failed: ${e.message}`); }
 
   // 4. Update history_index
