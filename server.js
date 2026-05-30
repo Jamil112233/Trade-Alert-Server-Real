@@ -504,22 +504,19 @@ function reconnectCapWs() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 5 — COINGECKO POLLING (Crypto prices — MEXC WS blocked on cloud IPs)
+// SECTION 5 — GATE.IO REST POLLING (Crypto prices)
 // ════════════════════════════════════════════════════════════════════════════
 
-const COINGECKO_IDS = {
-  BTC:'bitcoin', ETH:'ethereum', BNB:'binancecoin', SOL:'solana',
-  XRP:'ripple', ADA:'cardano', DOGE:'dogecoin', AVAX:'avalanche-2',
-  DOT:'polkadot', MATIC:'matic-network', LINK:'chainlink', UNI:'uniswap',
-  ATOM:'cosmos', LTC:'litecoin', BCH:'bitcoin-cash', NEAR:'near',
-  ARB:'arbitrum', OP:'optimism', SHIB:'shiba-inu', TRX:'tron'
+const GATE_SYMBOLS = {
+  BTC:'BTC_USDT', ETH:'ETH_USDT', BNB:'BNB_USDT', SOL:'SOL_USDT',
+  XRP:'XRP_USDT', ADA:'ADA_USDT', DOGE:'DOGE_USDT', AVAX:'AVAX_USDT',
+  DOT:'DOT_USDT', MATIC:'MATIC_USDT', LINK:'LINK_USDT', UNI:'UNI_USDT',
+  ATOM:'ATOM_USDT', LTC:'LTC_USDT', BCH:'BCH_USDT', NEAR:'NEAR_USDT',
+  ARB:'ARB_USDT', OP:'OP_USDT', SHIB:'SHIB_USDT', TRX:'TRX_USDT'
 };
 
-// Reverse map: coingecko id → symbol
-const CG_REVERSE = {};
-for (const [sym, id] of Object.entries(COINGECKO_IDS)) CG_REVERSE[id] = sym;
-
-const CG_IDS_STR = Object.values(COINGECKO_IDS).join(',');
+const GATE_REVERSE = {};
+for (const [sym, gs] of Object.entries(GATE_SYMBOLS)) GATE_REVERSE[gs] = sym;
 
 const MEXC_SYMBOLS = {
   BTC:'BTCUSDT', ETH:'ETHUSDT', BNB:'BNBUSDT', SOL:'SOLUSDT',
@@ -529,35 +526,34 @@ const MEXC_SYMBOLS = {
   ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT'
 };
 
-async function pollCoinGecko() {
+async function pollGateio() {
   try {
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${CG_IDS_STR}&vs_currencies=usd`;
-    const res = await fetchJson(url);
-    if (!res || typeof res !== 'object') {
-      warn(`CoinGecko returned invalid response: ${JSON.stringify(res)}`);
+    // Gate.io tickers endpoint — returns all spot tickers in one call
+    const res = await fetchJson('https://api.gateio.ws/api/v4/spot/tickers');
+    if (!Array.isArray(res)) {
+      warn(`Gate.io returned invalid response: ${JSON.stringify(res).slice(0,100)}`);
       return;
     }
     let updated = 0;
-    for (const [cgId, data] of Object.entries(res)) {
-      const sym   = CG_REVERSE[cgId];
-      const price = data?.usd;
+    for (const ticker of res) {
+      const sym = GATE_REVERSE[ticker.currency_pair];
+      const price = parseFloat(ticker.last) || 0;
       if (sym && price > 0) {
         livePrice[sym] = price;
         updateOpenCandle(sym, price);
         updated++;
       }
     }
-    log(`CoinGecko: ${updated} prices updated. BTC=${livePrice.BTC} ETH=${livePrice.ETH}`);
-  } catch(e) { warn(`CoinGecko poll error: ${e.message}`); }
+    log(`Gate.io: ${updated} prices updated. BTC=${livePrice.BTC} ETH=${livePrice.ETH}`);
+  } catch(e) { warn(`Gate.io poll error: ${e.message}`); }
 }
 
-// MEXC REST API for M1 candle close (REST is not blocked, only WebSocket)
+// MEXC REST API for M1 candle close (for candle-close alerts)
 async function pollMexcCandles() {
   for (const [sym, mSym] of Object.entries(MEXC_SYMBOLS)) {
     try {
       const url = `https://api.mexc.com/api/v3/klines?symbol=${mSym}&interval=1m&limit=2`;
       const res = await fetchJson(url);
-      // res[0] = previous closed candle: [openTime, open, high, low, close, ...]
       if (Array.isArray(res) && res.length >= 2) {
         const prev = res[0];
         m1Candle[sym] = {
@@ -566,7 +562,7 @@ async function pollMexcCandles() {
           close: parseFloat(prev[4]) || 0,
         };
       }
-    } catch(e) { /* skip this symbol */ }
+    } catch(e) { /* skip */ }
   }
 }
 
@@ -711,20 +707,12 @@ function checkAlerts() {
 }
 
 function getCandleClose(sym, tf) {
-  // Metals — use Capital.com OHLC data
   if (sym === 'XAU' || sym === 'XAG') {
-    const metalSym = sym === 'XAU' ? 'XAU' : 'XAG';
     const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    return metalOhlc[metalSym]?.[resMap[tf]]?.c || 0;
+    return metalOhlc[sym]?.[resMap[tf]]?.c || 0;
   }
-  // Crypto — use M1 candle close (from MEXC WebSocket)
-  if (MEXC_SYMBOLS[sym]) {
-    return m1Candle[sym]?.close || 0;
-  }
-  // Indices + Forex — use m1Candle close from Yahoo polling
-  if (YAHOO_SYMBOLS[sym]) {
-    return m1Candle[sym]?.close || 0;
-  }
+  if (GATE_SYMBOLS[sym])   return m1Candle[sym]?.close || 0;
+  if (YAHOO_SYMBOLS[sym])  return m1Candle[sym]?.close || 0;
   return 0;
 }
 
@@ -953,9 +941,9 @@ async function main() {
   // Ping Capital.com session every 9 minutes
   setInterval(pingCapSession, 9 * 60 * 1000);
 
-  // Poll CoinGecko every 10 seconds for live crypto prices
-  setInterval(pollCoinGecko, 10000);
-  pollCoinGecko(); // immediate first poll
+  // Poll Gate.io every 10 seconds for live crypto prices
+  setInterval(pollGateio, 10000);
+  pollGateio(); // immediate first poll
 
   // Poll MEXC REST every 60 seconds for M1 candle close (candle-close alerts)
   setInterval(pollMexcCandles, 60000);
