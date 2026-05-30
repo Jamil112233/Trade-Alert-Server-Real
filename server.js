@@ -528,17 +528,20 @@ const MEXC_SYMBOLS = {
 
 async function pollGateio() {
   try {
-    // Gate.io tickers endpoint — returns all spot tickers in one call
-    const res = await fetchJson('https://api.gateio.ws/api/v4/spot/tickers');
-    if (!Array.isArray(res)) {
-      warn(`Gate.io returned invalid response: ${JSON.stringify(res).slice(0,100)}`);
-      return;
-    }
+    // Fetch only the 20 symbols we need — much smaller response than all tickers
+    const results = await Promise.all(
+      Object.entries(GATE_SYMBOLS).map(async ([sym, gSym]) => {
+        try {
+          const res = await fetchJson(`https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${gSym}`);
+          const ticker = Array.isArray(res) ? res[0] : res;
+          const price  = parseFloat(ticker?.last) || 0;
+          return { sym, price };
+        } catch(e) { return { sym, price: 0 }; }
+      })
+    );
     let updated = 0;
-    for (const ticker of res) {
-      const sym = GATE_REVERSE[ticker.currency_pair];
-      const price = parseFloat(ticker.last) || 0;
-      if (sym && price > 0) {
+    for (const { sym, price } of results) {
+      if (price > 0) {
         livePrice[sym] = price;
         updateOpenCandle(sym, price);
         updated++;
@@ -1036,16 +1039,16 @@ async function main() {
   // Ping Capital.com session every 9 minutes
   setInterval(pingCapSession, 9 * 60 * 1000);
 
-  // Poll Gate.io every 10 seconds for live crypto prices
-  setInterval(pollGateio, 10000);
+  // Poll Gate.io every 15 seconds for live crypto prices (individual symbols = small responses)
+  setInterval(pollGateio, 15000);
   pollGateio(); // immediate first poll
 
   // Minute-boundary candle close checker — fires at start of each new minute
   startMinuteBoundaryChecker();
 
-  // Poll Yahoo Finance every 10 seconds for indices + forex
-  setInterval(pollYahoo, 10000);
-  pollYahoo(); // immediate first poll
+  // Poll Yahoo Finance every 30 seconds for indices + forex
+  setInterval(pollYahoo, 30000);
+  pollYahoo();
 
   // Update RTDB prices every 5 seconds (for mobile app display)
   setInterval(updateRtdbPrices, 5000);
