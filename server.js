@@ -548,23 +548,108 @@ async function pollGateio() {
   } catch(e) { warn(`Gate.io poll error: ${e.message}`); }
 }
 
-// Gate.io REST for M1 candle close (for candle-close alerts)
-async function pollGateioCandles() {
+// ── Minute-boundary candle close checker ─────────────────────────────────────
+// Fires exactly when a new minute starts (within ~1 second).
+// Fetches previous closed M1 candle from Gate.io, logs closes, checks alerts.
+
+let lastCandleMinute = -1;
+
+async function onMinuteClose() {
+  const nowMin = Math.floor(Date.now() / 60000);
+  if (nowMin === lastCandleMinute) return; // already processed this minute
+  lastCandleMinute = nowMin;
+
+  log(`── Minute ${nowMin} closed — fetching candle closes ──`);
+
+  // Fetch previous closed M1 candle for all Gate.io crypto pairs
   for (const [sym, gSym] of Object.entries(GATE_SYMBOLS)) {
     try {
       const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=1m&limit=2`;
       const res = await fetchJson(url);
-      // res = array of [timestamp, volume, close, high, low, open, ...]
+      // res[0] = oldest (previous closed), res[1] = current open
       if (Array.isArray(res) && res.length >= 2) {
-        const prev = res[0]; // first = oldest = previous closed candle
+        const prev = res[0];
+        const close = parseFloat(prev[2]) || 0;
         m1Candle[sym] = {
           high:  parseFloat(prev[3]) || 0,
           low:   parseFloat(prev[4]) || 0,
-          close: parseFloat(prev[2]) || 0,
+          close,
         };
+        if (close > 0) log(`  ${sym} M1 close: ${close}`);
+      }
+    } catch(e) { warn(`  Gate.io candle error [${sym}]: ${e.message}`); }
+  }
+
+  // Fetch previous M1 candle for Yahoo (indices + forex)
+  for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
+    try {
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
+      const res = await fetchJson(url);
+      const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
+      const times  = res?.chart?.result?.[0]?.timestamp;
+      if (quotes && times && times.length >= 2) {
+        const i     = times.length - 2;
+        const close = quotes.close?.[i] || 0;
+        if (close > 0) {
+          m1Candle[sym] = { close, high: quotes.high?.[i] || 0, low: quotes.low?.[i] || 0 };
+          log(`  ${sym} M1 close: ${close}`);
+        }
       }
     } catch(e) { /* skip */ }
   }
+
+  // Metals candle close comes from Capital.com WebSocket OHLC events — already in metalOhlc
+  log(`  XAU M1 close: ${metalOhlc.XAU?.MINUTE?.c || 'waiting...'}`);
+  log(`  XAG M1 close: ${metalOhlc.XAG?.MINUTE?.c || 'waiting...'}`);
+
+  // Now check ONLY candle-close alerts against the fresh closes
+  checkCandleCloseAlerts();
+}
+
+function checkCandleCloseAlerts() {
+  const alertList = Object.values(activeAlerts).filter(a => a.candleClose);
+  if (!alertList.length) return;
+
+  const nowMs = Date.now();
+  for (const alert of alertList) {
+    try {
+      if (recentlyTriggered.has(alert.id)) continue;
+      if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
+
+      // Skip if created less than 2 minutes ago
+      const ageMs = nowMs - (alert.createdAt || 0);
+      if (ageMs < 120000) continue;
+
+      const close = getCandleClose(alert.pairSymbol, alert.timeframe);
+      if (!close || close <= 0) continue;
+
+      const target = parseFloat(alert.targetPrice);
+      let hit = false;
+      if (alert.direction === 'above' && close >= target) hit = true;
+      if (alert.direction === 'below' && close <= target) hit = true;
+
+      if (hit) {
+        log(`🎯 Candle close alert triggered: ${alert.pairSymbol} ${alert.direction} ${target} (close=${close}) user=${alert.userId}`);
+        recentlyTriggered.add(alert.id);
+        processTriggeredAlert(alert, close).catch(e => {
+          err(`processTriggeredAlert error: ${e.message}`);
+          recentlyTriggered.delete(alert.id);
+        });
+      }
+    } catch(e) { warn(`checkCandleCloseAlerts error: ${e.message}`); }
+  }
+}
+
+// Schedule minute-boundary checks — polls every second near the minute roll
+function startMinuteBoundaryChecker() {
+  setInterval(() => {
+    const ms    = Date.now();
+    const secMs = ms % 60000; // milliseconds into current minute
+    // Fire when we're in the first 3 seconds of a new minute
+    if (secMs < 3000) {
+      onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
+    }
+  }, 1000);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -663,11 +748,8 @@ function checkAlerts() {
       // Server stopped — only process dev account
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
 
-      // Skip candle-close alerts created less than 2 minutes ago
-      if (alert.candleClose) {
-        const ageMs = nowMs - (alert.createdAt || 0);
-        if (ageMs < 120000) continue;
-      }
+      // Skip candle-close alerts — handled by checkCandleCloseAlerts() at minute boundary
+      if (alert.candleClose) continue;
 
       const price = livePrice[alert.pairSymbol];
       if (!price || price <= 0) continue;
@@ -678,28 +760,16 @@ function checkAlerts() {
       let hit      = false;
       let hitPrice = price;
 
-      if (!alert.candleClose) {
-        // ── Instant alert ──────────────────────────────────────────────
-        // Live WebSocket checks every second — no miss-hit needed.
-        // If price ever touches the target, we catch it in real time.
-        if (alert.direction === 'above' && price >= target) { hit = true; }
-        if (alert.direction === 'below' && price <= target) { hit = true; }
-
-      } else {
-        // ── Candle close alert ─────────────────────────────────────────
-        const candle = getCandleClose(alert.pairSymbol, alert.timeframe);
-        if (!candle) continue;
-        if (alert.direction === 'above' && candle >= target) { hit = true; hitPrice = candle; }
-        if (alert.direction === 'below' && candle <= target) { hit = true; hitPrice = candle; }
-      }
+      // ── Instant alert — live price check ───────────────────────────
+      if (alert.direction === 'above' && price >= target) { hit = true; }
+      if (alert.direction === 'below' && price <= target) { hit = true; }
 
       if (hit) {
         log(`🎯 Alert triggered: ${alert.pairSymbol} ${alert.direction} ${target} (price=${hitPrice}) user=${alert.userId}`);
         recentlyTriggered.add(alert.id);
-        // Process async but don't await — keep checker fast
         processTriggeredAlert(alert, hitPrice).catch(e => {
           err(`processTriggeredAlert error: ${e.message}`);
-          recentlyTriggered.delete(alert.id); // allow retry
+          recentlyTriggered.delete(alert.id);
         });
       }
 
@@ -947,9 +1017,8 @@ async function main() {
   setInterval(pollGateio, 10000);
   pollGateio(); // immediate first poll
 
-  // Poll Gate.io REST every 60 seconds for M1 candle close (candle-close alerts)
-  setInterval(pollGateioCandles, 60000);
-  pollGateioCandles();
+  // Minute-boundary candle close checker — fires at start of each new minute
+  startMinuteBoundaryChecker();
 
   // Poll Yahoo Finance every 10 seconds for indices + forex
   setInterval(pollYahoo, 10000);
