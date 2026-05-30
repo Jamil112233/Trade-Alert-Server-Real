@@ -172,13 +172,22 @@ async function firestoreGet(path) {
 }
 
 async function firestorePatch(path, fields) {
-  const token = await getAccessToken();
-  const BASE  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
-  return fetchJson(`${BASE}/${path}`, {
-    method:  'PATCH',
-    headers: { 'Authorization': `Bearer ${token}` },
-    body:    JSON.stringify({ fields })
-  });
+  const token    = await getAccessToken();
+  const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${path}`;
+  const fieldPaths = Object.keys(fields);
+  return fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+    {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      body:    JSON.stringify({
+        writes: [{
+          update:     { name: docPath, fields },
+          updateMask: { fieldPaths }
+        }]
+      })
+    }
+  );
 }
 
 async function firestoreDelete(path) {
@@ -750,52 +759,48 @@ async function processTriggeredAlert(alert, hitPrice) {
     log(`  RTDB deleted: ${alertId}`);
   } catch(e) { warn(`  RTDB delete failed: ${e.message}`); }
 
-  // 2. Delete from Firestore active_alerts (field in document)
+  // 2. Delete from Firestore active_alerts — use commit with field delete transform
   try {
     const token = await getAccessToken();
-    const BASE  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
-    // Use fieldTransform to delete just this field from the document
-    await fetchJson(`${BASE}/alerts/${userId}/active_alerts/alerts:commit`, {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${token}` },
-      body:    JSON.stringify({
-        writes: [{
-          transform: {
-            document: `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`,
-            fieldTransforms: [{ fieldPath: alertId, removeAllFromArray: { values: [] } }]
-          }
-        }]
-      })
-    });
-  } catch(e) { /* fallback below */ }
-
-  // Simpler approach: read the active_alerts doc, remove this field, write back
-  try {
-    const token = await getAccessToken();
-    const BASE  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
-    // Delete a specific field using PATCH with field mask
-    const updateMask = `updateMask.fieldPaths=${encodeURIComponent(alertId)}`;
-    await fetchJson(`${BASE}/alerts/${userId}/active_alerts/alerts?${updateMask}`, {
-      method:  'PATCH',
-      headers: { 'Authorization': `Bearer ${token}` },
-      body:    JSON.stringify({ fields: {} }) // empty fields + mask = delete that field
-    });
+    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
+    await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body:    JSON.stringify({
+          writes: [{
+            update: { name: docPath, fields: {} },
+            updateMask: { fieldPaths: [alertId] },
+            currentDocument: { exists: true }
+          }]
+        })
+      }
+    );
     log(`  Firestore active_alerts field deleted: ${alertId}`);
   } catch(e) { warn(`  Firestore active_alerts delete failed: ${e.message}`); }
 
-  // 3. Write to Firestore history (field in document)
+  // 3. Write to Firestore history — use commit to add field to history document
   try {
     const token    = await getAccessToken();
-    const BASE     = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
-    const hitAlert = { ...alert, triggered: true, hitAt: hitTime, hitPrice };
-    const updateMask = `updateMask.fieldPaths=${encodeURIComponent(alertId)}`;
-    await fetchJson(`${BASE}/alerts/${userId}/history/history?${updateMask}`, {
-      method:  'PATCH',
-      headers: { 'Authorization': `Bearer ${token}` },
-      body:    JSON.stringify({ fields: {
-        [alertId]: { stringValue: JSON.stringify(hitAlert) }
-      }})
-    });
+    const hitAlert = { ...alert, triggered: true, hitAt: hitTime };
+    const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
+    await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body:    JSON.stringify({
+          writes: [{
+            update: {
+              name:   docPath,
+              fields: { [alertId]: { stringValue: JSON.stringify(hitAlert) } }
+            },
+            updateMask: { fieldPaths: [alertId] }
+          }]
+        })
+      }
+    );
     log(`  Firestore history written: ${alertId}`);
   } catch(e) { warn(`  Firestore history write failed: ${e.message}`); }
 
