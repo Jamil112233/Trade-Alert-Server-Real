@@ -566,8 +566,9 @@ async function onMinuteClose() {
     try {
       const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=1m&limit=2`;
       const res = await fetchJson(url);
-      if (Array.isArray(res) && res.length >= 2) {
-        const prev  = res[0];
+      if (Array.isArray(res) && res.length >= 1) {
+        // Use last candle in response — Gate.io sometimes returns only 1
+        const prev  = res[res.length - 1];
         const close = parseFloat(prev[2]) || 0;
         m1Candle[sym] = {
           high:  parseFloat(prev[3]) || 0,
@@ -578,7 +579,7 @@ async function onMinuteClose() {
         if (sym === 'BTC' && close > 0) log(`  BTC M1 close: ${close}`);
         if (sym === 'BTC' && !close)    warn(`  BTC M1 close: missing! raw=${JSON.stringify(prev)}`);
       } else if (sym === 'BTC') {
-        warn(`  BTC candle response unexpected: ${JSON.stringify(res).slice(0,200)}`);
+        warn(`  BTC candle response empty: ${JSON.stringify(res).slice(0,200)}`);
       }
     } catch(e) {
       if (sym === 'BTC') warn(`  Gate.io BTC candle error: ${e.message}`);
