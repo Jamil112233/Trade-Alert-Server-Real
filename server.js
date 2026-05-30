@@ -556,37 +556,48 @@ let lastCandleMinute = -1;
 
 async function onMinuteClose() {
   const nowMin = Math.floor(Date.now() / 60000);
-  if (nowMin === lastCandleMinute) return; // already processed this minute
+  if (nowMin === lastCandleMinute) return;
   lastCandleMinute = nowMin;
 
-  log(`── Minute ${nowMin} closed — fetching candle closes ──`);
+  const closedM5  = nowMin % 5  === 0;
+  const closedM15 = nowMin % 15 === 0;
+  const closedH1  = nowMin % 60 === 0;
 
-  // Fetch previous closed M1 candle for all Gate.io crypto pairs
-  for (const [sym, gSym] of Object.entries(GATE_SYMBOLS)) {
-    try {
-      const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=1m&limit=2`;
-      const res = await fetchJson(url);
-      if (Array.isArray(res) && res.length >= 1) {
-        // Use last candle in response — Gate.io sometimes returns only 1
-        const prev  = res[res.length - 1];
-        const close = parseFloat(prev[2]) || 0;
-        m1Candle[sym] = {
-          high:  parseFloat(prev[3]) || 0,
-          low:   parseFloat(prev[4]) || 0,
-          close,
-        };
-        // Only log BTC for clean logs
-        if (sym === 'BTC' && close > 0) log(`  BTC M1 close: ${close}`);
-        if (sym === 'BTC' && !close)    warn(`  BTC M1 close: missing! raw=${JSON.stringify(prev)}`);
-      } else if (sym === 'BTC') {
-        warn(`  BTC candle response empty: ${JSON.stringify(res).slice(0,200)}`);
+  const closedTfs = ['M1'];
+  if (closedM5)  closedTfs.push('M5');
+  if (closedM15) closedTfs.push('M15');
+  if (closedH1)  closedTfs.push('H1');
+
+  log(`── Minute ${nowMin} closed [${closedTfs.join(' ')}] ──`);
+
+  const gateIntervals = { M1:'1m', M5:'5m', M15:'15m', H1:'1h' };
+
+  // Fetch candles for each closed timeframe from Gate.io
+  for (const tf of closedTfs) {
+    const interval = gateIntervals[tf];
+    for (const [sym, gSym] of Object.entries(GATE_SYMBOLS)) {
+      try {
+        const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=${interval}&limit=2`;
+        const res = await fetchJson(url);
+        if (Array.isArray(res) && res.length >= 1) {
+          const prev  = res[res.length - 1];
+          const close = parseFloat(prev[2]) || 0;
+          if (!m1Candle[sym])       m1Candle[sym]       = {};
+          if (!m1Candle[sym].byTf)  m1Candle[sym].byTf  = {};
+          m1Candle[sym].byTf[tf] = { high: parseFloat(prev[3])||0, low: parseFloat(prev[4])||0, close };
+          if (tf === 'M1') m1Candle[sym].close = close;
+          if (sym === 'BTC' && close > 0) log(`  BTC ${tf} close: ${close}`);
+          if (sym === 'BTC' && !close)    warn(`  BTC ${tf} close missing! raw=${JSON.stringify(prev)}`);
+        } else if (sym === 'BTC') {
+          warn(`  BTC ${tf} candle empty: ${JSON.stringify(res).slice(0,100)}`);
+        }
+      } catch(e) {
+        if (sym === 'BTC') warn(`  Gate.io BTC ${tf} error: ${e.message}`);
       }
-    } catch(e) {
-      if (sym === 'BTC') warn(`  Gate.io BTC candle error: ${e.message}`);
     }
   }
 
-  // Fetch previous M1 candle for Yahoo (indices + forex) — no logging needed
+  // Yahoo — M1 only for indices + forex
   for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
@@ -594,21 +605,27 @@ async function onMinuteClose() {
       const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
       const times  = res?.chart?.result?.[0]?.timestamp;
       if (quotes && times && times.length >= 2) {
-        const i     = times.length - 2;
+        const i = times.length - 2;
         const close = quotes.close?.[i] || 0;
         if (close > 0) {
-          m1Candle[sym] = { close, high: quotes.high?.[i] || 0, low: quotes.low?.[i] || 0 };
+          if (!m1Candle[sym])       m1Candle[sym]       = {};
+          if (!m1Candle[sym].byTf)  m1Candle[sym].byTf  = {};
+          m1Candle[sym].byTf['M1'] = { close, high: quotes.high?.[i]||0, low: quotes.low?.[i]||0 };
+          m1Candle[sym].close = close;
         }
       }
     } catch(e) { /* skip */ }
   }
 
-  // Metals close from Capital.com WebSocket OHLC — no extra fetch needed
-  checkCandleCloseAlerts();
-}
+  // Metals — Capital.com WebSocket stores OHLC in metalOhlc automatically
 
-function checkCandleCloseAlerts() {
-  const alertList = Object.values(activeAlerts).filter(a => a.candleClose);
+  // Check alerts for all timeframes that just closed
+  checkCandleCloseAlerts(closedTfs);
+}
+function checkCandleCloseAlerts(closedTfs) {
+  const alertList = Object.values(activeAlerts).filter(a =>
+    a.candleClose && closedTfs.includes(a.timeframe)
+  );
   if (!alertList.length) return;
 
   const nowMs = Date.now();
@@ -779,13 +796,13 @@ function checkAlerts() {
 }
 
 function getCandleClose(sym, tf) {
+  // Metals — Capital.com WebSocket OHLC
   if (sym === 'XAU' || sym === 'XAG') {
     const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
     return metalOhlc[sym]?.[resMap[tf]]?.c || 0;
   }
-  if (GATE_SYMBOLS[sym])   return m1Candle[sym]?.close || 0;
-  if (YAHOO_SYMBOLS[sym])  return m1Candle[sym]?.close || 0;
-  return 0;
+  // Crypto (Gate.io) + Indices/Forex (Yahoo) — use byTf structure
+  return m1Candle[sym]?.byTf?.[tf]?.close || 0;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
