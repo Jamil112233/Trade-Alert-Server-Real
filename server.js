@@ -466,9 +466,8 @@ function connectCapWs() {
         const ask = msg.payload.ofr || 0;
         const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : (bid || ask);
         if (mid > 0) {
-          const prev = livePrice[sym];
           livePrice[sym] = mid;
-          updateOpenCandle(sym, mid, prev);
+          updateOpenCandle(sym, mid);
         }
       }
 
@@ -529,62 +528,80 @@ function connectMexcWs() {
   mexcWs.on('open', () => {
     log('MEXC WebSocket connected');
 
-    // Subscribe to mini-ticker for all crypto symbols (price updates)
-    const params = Object.values(MEXC_SYMBOLS).map(s => `spot@public.miniTicker.v3.api@${s}@UTC+0`);
-    mexcWs.send(JSON.stringify({ method: 'SUBSCRIPTION', params }));
+    // Subscribe to mini-ticker for all crypto pairs — correct MEXC format
+    const tickerParams = Object.values(MEXC_SYMBOLS)
+      .map(s => `spot@public.miniTicker.v3.api@${s}@UTC+0`);
+    mexcWs.send(JSON.stringify({ method: 'SUBSCRIPTION', params: tickerParams }));
 
-    // Subscribe to M1 kline for candle data
-    const klineParams = Object.values(MEXC_SYMBOLS).map(s => `spot@public.kline.v3.api@${s}@Min1`);
+    // Subscribe to M1 kline for candle close data
+    const klineParams = Object.values(MEXC_SYMBOLS)
+      .map(s => `spot@public.kline.v3.api@${s}@Min1`);
     mexcWs.send(JSON.stringify({ method: 'SUBSCRIPTION', params: klineParams }));
 
-    // MEXC requires ping every 30s
+    // MEXC requires ping every 20s — must use exact format they expect
     if (mexcWs._ping) clearInterval(mexcWs._ping);
     mexcWs._ping = setInterval(() => {
       if (mexcWs && mexcWs.readyState === WebSocket.OPEN) {
-        mexcWs.send(JSON.stringify({ method: 'PING' }));
+        // MEXC accepts raw string "ping" not JSON
+        mexcWs.ping();
       }
     }, 20000);
   });
 
-  mexcWs.on('message', data => {
-    try {
-      const msg = JSON.parse(data.toString());
-
-      // Mini ticker — live price
-      if (msg.c === 'spot@public.miniTicker.v3.api') {
-        const mSym = msg.s;
-        const sym  = MEXC_REVERSE[mSym];
-        const price = parseFloat(msg.d?.c || 0);
-        if (sym && price > 0) {
-          const prev = livePrice[sym];
-          livePrice[sym] = price;
-          updateOpenCandle(sym, price, prev);
-        }
-      }
-
-      // Kline (candle) — M1 close
-      if (msg.c === 'spot@public.kline.v3.api') {
-        const mSym = msg.s;
-        const sym  = MEXC_REVERSE[mSym];
-        if (sym && msg.d?.k) {
-          const k = msg.d.k;
-          // k.x = true means candle is closed
-          if (k.x) {
-            m1Candle[sym] = {
-              high:  parseFloat(k.h) || 0,
-              low:   parseFloat(k.l) || 0,
-              close: parseFloat(k.c) || 0,
-            };
-          }
-        }
-      }
-
-    } catch(e) { /* ignore */ }
+  mexcWs.on('pong', () => {
+    // MEXC responded to our ping — connection alive
   });
 
-  mexcWs.on('close', (code) => {
+  mexcWs.on('message', data => {
+    try {
+      const str = data.toString();
+      // MEXC sometimes sends plain "pong"
+      if (str === 'pong') return;
+
+      const msg = JSON.parse(str);
+
+      // Subscription confirmation
+      if (msg.code !== undefined) {
+        if (msg.code === 0) log(`MEXC subscription ok: ${msg.msg || ''}`);
+        else warn(`MEXC subscription error: ${JSON.stringify(msg)}`);
+        return;
+      }
+
+      // Mini ticker — live price update
+      // Format: { c: 'spot@public.miniTicker.v3.api', s: 'BTCUSDT', d: { c: '104500.00', ... } }
+      if (msg.c && msg.c.includes('miniTicker') && msg.d) {
+        const mSym  = msg.s;
+        const sym   = MEXC_REVERSE[mSym];
+        const price = parseFloat(msg.d.c || 0);
+        if (sym && price > 0) {
+          livePrice[sym] = price;
+          updateOpenCandle(sym, price);
+        }
+        return;
+      }
+
+      // Kline candle close
+      // Format: { c: 'spot@public.kline.v3.api', s: 'BTCUSDT', d: { k: { x: true, c: '...', h: '...', l: '...' } } }
+      if (msg.c && msg.c.includes('kline') && msg.d?.k) {
+        const mSym = msg.s;
+        const sym  = MEXC_REVERSE[mSym];
+        if (sym && msg.d.k.x === true) {
+          // Candle closed — save for candle-close alert checks
+          m1Candle[sym] = {
+            high:  parseFloat(msg.d.k.h) || 0,
+            low:   parseFloat(msg.d.k.l) || 0,
+            close: parseFloat(msg.d.k.c) || 0,
+          };
+        }
+        return;
+      }
+
+    } catch(e) { /* ignore parse errors */ }
+  });
+
+  mexcWs.on('close', (code, reason) => {
     if (mexcWs._ping) { clearInterval(mexcWs._ping); mexcWs._ping = null; }
-    warn(`MEXC WS closed ${code} — reconnecting in 5s`);
+    warn(`MEXC WS closed ${code} ${reason?.toString() || ''} — reconnecting in 5s`);
     setTimeout(connectMexcWs, 5000);
   });
 
@@ -633,7 +650,7 @@ async function pollYahoo() {
 // When the minute rolls, the completed candle's close is saved to m1Candle.
 // Used ONLY for candle-close alerts — instant alerts use live price directly.
 
-function updateOpenCandle(sym, price, prevPrice) {
+function updateOpenCandle(sym, price) {
   const nowMin = Math.floor(Date.now() / 60000);
   if (!openCandle[sym]) {
     openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
@@ -641,8 +658,8 @@ function updateOpenCandle(sym, price, prevPrice) {
   }
   const oc = openCandle[sym];
   if (oc.startMin !== nowMin) {
-    // Minute rolled — save completed candle as m1Candle
-    m1Candle[sym] = { high: oc.high, low: oc.low, close: prevPrice || oc.open };
+    // Minute rolled — save completed candle close for candle-close alerts
+    m1Candle[sym] = { high: oc.high, low: oc.low, close: oc.open };
     openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
   } else {
     if (price > oc.high) oc.high = price;
