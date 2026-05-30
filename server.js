@@ -747,7 +747,7 @@ async function processTriggeredAlert(alert, hitPrice) {
         body:    JSON.stringify({
           writes: [{
             update:     { name: docPath, fields: {} },
-            updateMask: { fieldPaths: [`${alertId}`] }
+            updateMask: { fieldPaths: ['`' + alertId + '`'] }
           }]
         })
       }
@@ -772,7 +772,7 @@ async function processTriggeredAlert(alert, hitPrice) {
               name:   docPath,
               fields: { [alertId]: { stringValue: JSON.stringify(hitAlert) } }
             },
-            updateMask: { fieldPaths: [`${alertId}`] }
+            updateMask: { fieldPaths: ['`' + alertId + '`'] }
           }]
         })
       }
