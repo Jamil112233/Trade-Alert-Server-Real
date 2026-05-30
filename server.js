@@ -641,15 +641,6 @@ function checkCandleCloseAlerts(closedTfs) {
       }
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
 
-      // Skip if created less than 2 minutes ago
-      // createdAt may come as string from RTDB — parse it
-      const createdAt = typeof alert.createdAt === 'string'
-        ? parseInt(alert.createdAt) : (alert.createdAt || 0);
-      const ageMs = nowMs - createdAt;
-      if (ageMs < 90000) {
-        log(`    SKIP ${alert.pairSymbol}: too new (${Math.round(ageMs/1000)}s old)`); continue;
-      }
-
       const close = getCandleClose(alert.pairSymbol, alert.timeframe);
       log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction}`);
       if (!close || close <= 0) continue;
