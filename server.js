@@ -636,12 +636,19 @@ function checkCandleCloseAlerts(closedTfs) {
   const nowMs = Date.now();
   for (const alert of alertList) {
     try {
-      if (recentlyTriggered.has(alert.id)) continue;
+      if (recentlyTriggered.has(alert.id)) {
+        log(`    SKIP ${alert.id}: recentlyTriggered`); continue;
+      }
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
 
       // Skip if created less than 2 minutes ago
-      const ageMs = nowMs - (alert.createdAt || 0);
-      if (ageMs < 120000) continue;
+      // createdAt may come as string from RTDB — parse it
+      const createdAt = typeof alert.createdAt === 'string'
+        ? parseInt(alert.createdAt) : (alert.createdAt || 0);
+      const ageMs = nowMs - createdAt;
+      if (ageMs < 120000) {
+        log(`    SKIP ${alert.pairSymbol}: too new (${Math.round(ageMs/1000)}s old)`); continue;
+      }
 
       const close = getCandleClose(alert.pairSymbol, alert.timeframe);
       log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction}`);
