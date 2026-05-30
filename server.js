@@ -623,8 +623,13 @@ async function onMinuteClose() {
   checkCandleCloseAlerts(closedTfs);
 }
 function checkCandleCloseAlerts(closedTfs) {
-  const alertList = Object.values(activeAlerts).filter(a =>
-    a.candleClose && closedTfs.includes(a.timeframe)
+  const all        = Object.values(activeAlerts);
+  const alertList  = all.filter(a => a.candleClose && closedTfs.includes(a.timeframe));
+
+  log(`  checkCandleCloseAlerts: ${all.length} total, ${alertList.length} match [${closedTfs.join(',')}]`);
+  // Debug: show all candle alerts and their timeframes
+  all.filter(a => a.candleClose).forEach(a =>
+    log(`    alert: ${a.pairSymbol} ${a.direction} ${a.targetPrice} tf=${a.timeframe} candleClose=${a.candleClose}`)
   );
   if (!alertList.length) return;
 
@@ -639,6 +644,7 @@ function checkCandleCloseAlerts(closedTfs) {
       if (ageMs < 120000) continue;
 
       const close = getCandleClose(alert.pairSymbol, alert.timeframe);
+      log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction}`);
       if (!close || close <= 0) continue;
 
       const target = parseFloat(alert.targetPrice);
