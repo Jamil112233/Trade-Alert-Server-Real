@@ -480,8 +480,8 @@ function connectCapWs() {
         if (c && h && l) {
           metalOhlc[sym][res] = { h, l, c, t: msg.payload.t };
           if (res === 'MINUTE') {
-            // Update m1Candle for miss-hit detection
-            m1Candle[sym] = { high: h, low: l, close: c };
+            const existingByTf = m1Candle[sym]?.byTf;
+            m1Candle[sym] = { high: h, low: l, close: c, byTf: existingByTf || {} };
           }
         }
       }
@@ -646,7 +646,7 @@ function checkCandleCloseAlerts(closedTfs) {
       const createdAt = typeof alert.createdAt === 'string'
         ? parseInt(alert.createdAt) : (alert.createdAt || 0);
       const ageMs = nowMs - createdAt;
-      if (ageMs < 120000) {
+      if (ageMs < 90000) {
         log(`    SKIP ${alert.pairSymbol}: too new (${Math.round(ageMs/1000)}s old)`); continue;
       }
 
@@ -733,8 +733,9 @@ function updateOpenCandle(sym, price) {
   }
   const oc = openCandle[sym];
   if (oc.startMin !== nowMin) {
-    // Minute rolled — save completed candle close for candle-close alerts
-    m1Candle[sym] = { high: oc.high, low: oc.low, close: oc.open };
+    // Minute rolled — save completed candle close, preserve byTf
+    const existingByTf = m1Candle[sym]?.byTf;
+    m1Candle[sym] = { high: oc.high, low: oc.low, close: oc.open, byTf: existingByTf || {} };
     openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
   } else {
     if (price > oc.high) oc.high = price;
