@@ -533,15 +533,21 @@ async function pollCoinGecko() {
   try {
     const url = `https://api.coingecko.com/api/v3/simple/price?ids=${CG_IDS_STR}&vs_currencies=usd`;
     const res = await fetchJson(url);
-    if (!res || typeof res !== 'object') return;
+    if (!res || typeof res !== 'object') {
+      warn(`CoinGecko returned invalid response: ${JSON.stringify(res)}`);
+      return;
+    }
+    let updated = 0;
     for (const [cgId, data] of Object.entries(res)) {
       const sym   = CG_REVERSE[cgId];
       const price = data?.usd;
       if (sym && price > 0) {
         livePrice[sym] = price;
         updateOpenCandle(sym, price);
+        updated++;
       }
     }
+    log(`CoinGecko: ${updated} prices updated. BTC=${livePrice.BTC} ETH=${livePrice.ETH}`);
   } catch(e) { warn(`CoinGecko poll error: ${e.message}`); }
 }
 
@@ -638,8 +644,16 @@ async function checkServerStopFlag() {
   } catch(e) { /* keep current state */ }
 }
 
+let _checkCount = 0;
 function checkAlerts() {
+  _checkCount++;
   const alertList = Object.values(activeAlerts);
+
+  // Log every 30 seconds so we know the checker is alive
+  if (_checkCount % 30 === 0) {
+    log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU}`);
+  }
+
   if (!alertList.length) return;
 
   const nowMs = Date.now();
