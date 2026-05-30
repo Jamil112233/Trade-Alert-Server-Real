@@ -566,21 +566,26 @@ async function onMinuteClose() {
     try {
       const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=1m&limit=2`;
       const res = await fetchJson(url);
-      // res[0] = oldest (previous closed), res[1] = current open
       if (Array.isArray(res) && res.length >= 2) {
-        const prev = res[0];
+        const prev  = res[0];
         const close = parseFloat(prev[2]) || 0;
         m1Candle[sym] = {
           high:  parseFloat(prev[3]) || 0,
           low:   parseFloat(prev[4]) || 0,
           close,
         };
-        if (close > 0) log(`  ${sym} M1 close: ${close}`);
+        // Only log BTC for clean logs
+        if (sym === 'BTC' && close > 0) log(`  BTC M1 close: ${close}`);
+        if (sym === 'BTC' && !close)    warn(`  BTC M1 close: missing! raw=${JSON.stringify(prev)}`);
+      } else if (sym === 'BTC') {
+        warn(`  BTC candle response unexpected: ${JSON.stringify(res).slice(0,200)}`);
       }
-    } catch(e) { warn(`  Gate.io candle error [${sym}]: ${e.message}`); }
+    } catch(e) {
+      if (sym === 'BTC') warn(`  Gate.io BTC candle error: ${e.message}`);
+    }
   }
 
-  // Fetch previous M1 candle for Yahoo (indices + forex)
+  // Fetch previous M1 candle for Yahoo (indices + forex) — no logging needed
   for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
@@ -592,17 +597,12 @@ async function onMinuteClose() {
         const close = quotes.close?.[i] || 0;
         if (close > 0) {
           m1Candle[sym] = { close, high: quotes.high?.[i] || 0, low: quotes.low?.[i] || 0 };
-          log(`  ${sym} M1 close: ${close}`);
         }
       }
     } catch(e) { /* skip */ }
   }
 
-  // Metals candle close comes from Capital.com WebSocket OHLC events — already in metalOhlc
-  log(`  XAU M1 close: ${metalOhlc.XAU?.MINUTE?.c || 'waiting...'}`);
-  log(`  XAG M1 close: ${metalOhlc.XAG?.MINUTE?.c || 'waiting...'}`);
-
-  // Now check ONLY candle-close alerts against the fresh closes
+  // Metals close from Capital.com WebSocket OHLC — no extra fetch needed
   checkCandleCloseAlerts();
 }
 
