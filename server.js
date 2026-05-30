@@ -504,8 +504,22 @@ function reconnectCapWs() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 5 — MEXC WEBSOCKET (Crypto)
+// SECTION 5 — COINGECKO POLLING (Crypto prices — MEXC WS blocked on cloud IPs)
 // ════════════════════════════════════════════════════════════════════════════
+
+const COINGECKO_IDS = {
+  BTC:'bitcoin', ETH:'ethereum', BNB:'binancecoin', SOL:'solana',
+  XRP:'ripple', ADA:'cardano', DOGE:'dogecoin', AVAX:'avalanche-2',
+  DOT:'polkadot', MATIC:'matic-network', LINK:'chainlink', UNI:'uniswap',
+  ATOM:'cosmos', LTC:'litecoin', BCH:'bitcoin-cash', NEAR:'near',
+  ARB:'arbitrum', OP:'optimism', SHIB:'shiba-inu', TRX:'tron'
+};
+
+// Reverse map: coingecko id → symbol
+const CG_REVERSE = {};
+for (const [sym, id] of Object.entries(COINGECKO_IDS)) CG_REVERSE[id] = sym;
+
+const CG_IDS_STR = Object.values(COINGECKO_IDS).join(',');
 
 const MEXC_SYMBOLS = {
   BTC:'BTCUSDT', ETH:'ETHUSDT', BNB:'BNBUSDT', SOL:'SOLUSDT',
@@ -515,97 +529,39 @@ const MEXC_SYMBOLS = {
   ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT'
 };
 
-// Reverse map: BTCUSDT → BTC
-const MEXC_REVERSE = {};
-for (const [sym, ms] of Object.entries(MEXC_SYMBOLS)) MEXC_REVERSE[ms] = sym;
-
-let mexcWs = null;
-
-function connectMexcWs() {
-  log('Connecting MEXC WebSocket...');
-  mexcWs = new WebSocket('wss://wbs.mexc.com/ws');
-
-  mexcWs.on('open', () => {
-    log('MEXC WebSocket connected');
-
-    // Subscribe to mini-ticker for all crypto pairs — correct MEXC format
-    const tickerParams = Object.values(MEXC_SYMBOLS)
-      .map(s => `spot@public.miniTicker.v3.api@${s}@UTC+0`);
-    mexcWs.send(JSON.stringify({ method: 'SUBSCRIPTION', params: tickerParams }));
-
-    // Subscribe to M1 kline for candle close data
-    const klineParams = Object.values(MEXC_SYMBOLS)
-      .map(s => `spot@public.kline.v3.api@${s}@Min1`);
-    mexcWs.send(JSON.stringify({ method: 'SUBSCRIPTION', params: klineParams }));
-
-    // MEXC requires ping every 20s — must use exact format they expect
-    if (mexcWs._ping) clearInterval(mexcWs._ping);
-    mexcWs._ping = setInterval(() => {
-      if (mexcWs && mexcWs.readyState === WebSocket.OPEN) {
-        // MEXC accepts raw string "ping" not JSON
-        mexcWs.ping();
+async function pollCoinGecko() {
+  try {
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${CG_IDS_STR}&vs_currencies=usd`;
+    const res = await fetchJson(url);
+    if (!res || typeof res !== 'object') return;
+    for (const [cgId, data] of Object.entries(res)) {
+      const sym   = CG_REVERSE[cgId];
+      const price = data?.usd;
+      if (sym && price > 0) {
+        livePrice[sym] = price;
+        updateOpenCandle(sym, price);
       }
-    }, 20000);
-  });
+    }
+  } catch(e) { warn(`CoinGecko poll error: ${e.message}`); }
+}
 
-  mexcWs.on('pong', () => {
-    // MEXC responded to our ping — connection alive
-  });
-
-  mexcWs.on('message', data => {
+// MEXC REST API for M1 candle close (REST is not blocked, only WebSocket)
+async function pollMexcCandles() {
+  for (const [sym, mSym] of Object.entries(MEXC_SYMBOLS)) {
     try {
-      const str = data.toString();
-      // MEXC sometimes sends plain "pong"
-      if (str === 'pong') return;
-
-      const msg = JSON.parse(str);
-
-      // Subscription confirmation
-      if (msg.code !== undefined) {
-        if (msg.code === 0) log(`MEXC subscription ok: ${msg.msg || ''}`);
-        else warn(`MEXC subscription error: ${JSON.stringify(msg)}`);
-        return;
+      const url = `https://api.mexc.com/api/v3/klines?symbol=${mSym}&interval=1m&limit=2`;
+      const res = await fetchJson(url);
+      // res[0] = previous closed candle: [openTime, open, high, low, close, ...]
+      if (Array.isArray(res) && res.length >= 2) {
+        const prev = res[0];
+        m1Candle[sym] = {
+          high:  parseFloat(prev[2]) || 0,
+          low:   parseFloat(prev[3]) || 0,
+          close: parseFloat(prev[4]) || 0,
+        };
       }
-
-      // Mini ticker — live price update
-      // Format: { c: 'spot@public.miniTicker.v3.api', s: 'BTCUSDT', d: { c: '104500.00', ... } }
-      if (msg.c && msg.c.includes('miniTicker') && msg.d) {
-        const mSym  = msg.s;
-        const sym   = MEXC_REVERSE[mSym];
-        const price = parseFloat(msg.d.c || 0);
-        if (sym && price > 0) {
-          livePrice[sym] = price;
-          updateOpenCandle(sym, price);
-        }
-        return;
-      }
-
-      // Kline candle close
-      // Format: { c: 'spot@public.kline.v3.api', s: 'BTCUSDT', d: { k: { x: true, c: '...', h: '...', l: '...' } } }
-      if (msg.c && msg.c.includes('kline') && msg.d?.k) {
-        const mSym = msg.s;
-        const sym  = MEXC_REVERSE[mSym];
-        if (sym && msg.d.k.x === true) {
-          // Candle closed — save for candle-close alert checks
-          m1Candle[sym] = {
-            high:  parseFloat(msg.d.k.h) || 0,
-            low:   parseFloat(msg.d.k.l) || 0,
-            close: parseFloat(msg.d.k.c) || 0,
-          };
-        }
-        return;
-      }
-
-    } catch(e) { /* ignore parse errors */ }
-  });
-
-  mexcWs.on('close', (code, reason) => {
-    if (mexcWs._ping) { clearInterval(mexcWs._ping); mexcWs._ping = null; }
-    warn(`MEXC WS closed ${code} ${reason?.toString() || ''} — reconnecting in 5s`);
-    setTimeout(connectMexcWs, 5000);
-  });
-
-  mexcWs.on('error', e => warn(`MEXC WS error: ${e.message}`));
+    } catch(e) { /* skip this symbol */ }
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -983,8 +939,13 @@ async function main() {
   // Ping Capital.com session every 9 minutes
   setInterval(pingCapSession, 9 * 60 * 1000);
 
-  // Start MEXC WebSocket
-  connectMexcWs();
+  // Poll CoinGecko every 10 seconds for live crypto prices
+  setInterval(pollCoinGecko, 10000);
+  pollCoinGecko(); // immediate first poll
+
+  // Poll MEXC REST every 60 seconds for M1 candle close (candle-close alerts)
+  setInterval(pollMexcCandles, 60000);
+  pollMexcCandles();
 
   // Poll Yahoo Finance every 10 seconds for indices + forex
   setInterval(pollYahoo, 10000);
