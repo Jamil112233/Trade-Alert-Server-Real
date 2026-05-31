@@ -526,13 +526,72 @@ const MEXC_SYMBOLS = {
   ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT'
 };
 
+let gateWs = null;
+let gateWsConnected = false;
+
+function connectGateWs() {
+  log('Connecting Gate.io WebSocket...');
+  gateWs = new WebSocket('wss://api.gateio.ws/ws/v4/');
+
+  gateWs.on('open', () => {
+    log('Gate.io WebSocket connected');
+    gateWsConnected = true;
+
+    const tickers = Object.values(GATE_SYMBOLS);
+    gateWs.send(JSON.stringify({
+      time:    Math.floor(Date.now() / 1000),
+      channel: 'spot.tickers',
+      event:   'subscribe',
+      payload: tickers
+    }));
+
+    if (gateWs._ping) clearInterval(gateWs._ping);
+    gateWs._ping = setInterval(() => {
+      if (gateWs && gateWs.readyState === WebSocket.OPEN) {
+        gateWs.send(JSON.stringify({ time: Math.floor(Date.now()/1000), channel: 'spot.ping' }));
+      }
+    }, 30000);
+  });
+
+  gateWs.on('message', data => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.event === 'subscribe') {
+        if (msg.error) warn(`Gate.io WS subscribe error: ${JSON.stringify(msg.error)}`);
+        else log(`Gate.io WS subscribed: ${msg.channel}`);
+        return;
+      }
+      if (msg.channel === 'spot.pong') return;
+      if (msg.channel === 'spot.tickers' && msg.event === 'update') {
+        const result = msg.result;
+        const sym    = GATE_REVERSE[result?.currency_pair];
+        const price  = parseFloat(result?.last) || 0;
+        if (sym && price > 0) {
+          livePrice[sym] = price;
+          updateOpenCandle(sym, price);
+        }
+      }
+    } catch(e) { /* ignore */ }
+  });
+
+  gateWs.on('close', (code) => {
+    gateWsConnected = false;
+    if (gateWs._ping) { clearInterval(gateWs._ping); gateWs._ping = null; }
+    warn(`Gate.io WS closed ${code} — reconnecting in 5s`);
+    setTimeout(connectGateWs, 5000);
+  });
+
+  gateWs.on('error', e => warn(`Gate.io WS error: ${e.message}`));
+}
+
+// Fallback REST polling — only runs if WebSocket is not connected
 async function pollGateio() {
+  if (gateWsConnected) return;
   try {
-    // Fetch only the 20 symbols we need — much smaller response than all tickers
     const results = await Promise.all(
       Object.entries(GATE_SYMBOLS).map(async ([sym, gSym]) => {
         try {
-          const res = await fetchJson(`https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${gSym}`);
+          const res    = await fetchJson(`https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${gSym}`);
           const ticker = Array.isArray(res) ? res[0] : res;
           const price  = parseFloat(ticker?.last) || 0;
           return { sym, price };
@@ -541,19 +600,112 @@ async function pollGateio() {
     );
     let updated = 0;
     for (const { sym, price } of results) {
-      if (price > 0) {
-        livePrice[sym] = price;
-        updateOpenCandle(sym, price);
-        updated++;
-      }
+      if (price > 0) { livePrice[sym] = price; updateOpenCandle(sym, price); updated++; }
     }
-    log(`Gate.io: ${updated} prices updated. BTC=${livePrice.BTC} ETH=${livePrice.ETH}`);
-  } catch(e) { warn(`Gate.io poll error: ${e.message}`); }
+    if (updated > 0) log(`Gate.io REST fallback: ${updated} prices. BTC=${livePrice.BTC}`);
+  } catch(e) { warn(`Gate.io REST fallback error: ${e.message}`); }
 }
 
-// ── Minute-boundary candle close checker ─────────────────────────────────────
-// Fires exactly when a new minute starts (within ~1 second).
-// Fetches previous closed M1 candle from Gate.io, logs closes, checks alerts.
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 6 — YAHOO FINANCE POLLING (Indices + Forex)
+// ════════════════════════════════════════════════════════════════════════════
+
+const YAHOO_SYMBOLS = {
+  SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5EIXIC',
+  DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
+  EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
+  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X', USDGBP: 'GBPUSD=X'
+};
+
+async function pollYahoo() {
+  for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
+    try {
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=2m`;
+      const res = await fetchJson(url);
+      const meta  = res?.chart?.result?.[0]?.meta;
+      const price = parseFloat(meta?.regularMarketPrice) || 0;
+      if (price > 0) livePrice[sym] = price;
+    } catch(e) { /* skip */ }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 7 — CANDLE BUILDER (tick-based M1 for candle close alerts)
+// ════════════════════════════════════════════════════════════════════════════
+
+function updateOpenCandle(sym, price) {
+  const nowMin = Math.floor(Date.now() / 60000);
+  if (!openCandle[sym]) {
+    openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
+    return;
+  }
+  const oc = openCandle[sym];
+  if (oc.startMin !== nowMin) {
+    const existingByTf = m1Candle[sym]?.byTf;
+    m1Candle[sym] = { high: oc.high, low: oc.low, close: oc.open, byTf: existingByTf || {} };
+    openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
+  } else {
+    if (price > oc.high) oc.high = price;
+    if (price < oc.low)  oc.low  = price;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — PRICE ALERT CHECKER (instant alerts every second)
+// ════════════════════════════════════════════════════════════════════════════
+
+let serverStopped = false;
+
+async function checkServerStopFlag() {
+  try {
+    const val = await rtdbGet('worker_control/stop');
+    serverStopped = val === true || val === 'true';
+    if (serverStopped) log('Server stop flag is TRUE — only dev alerts will be checked');
+  } catch(e) { /* keep current state */ }
+}
+
+let _checkCount = 0;
+function checkAlerts() {
+  _checkCount++;
+  const alertList = Object.values(activeAlerts);
+
+  if (_checkCount % 30 === 0) {
+    log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU}`);
+  }
+  if (!alertList.length) return;
+
+  const nowMs = Date.now();
+  for (const alert of alertList) {
+    try {
+      if (recentlyTriggered.has(alert.id)) continue;
+      if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
+      if (alert.candleClose) continue; // handled by checkCandleCloseAlerts at minute boundary
+
+      const price = livePrice[alert.pairSymbol];
+      if (!price || price <= 0) continue;
+
+      const target = parseFloat(alert.targetPrice);
+      if (!target) continue;
+
+      let hit = false;
+      if (alert.direction === 'above' && price >= target) hit = true;
+      if (alert.direction === 'below' && price <= target) hit = true;
+
+      if (hit) {
+        log(`🎯 Alert triggered: ${alert.pairSymbol} ${alert.direction} ${target} (price=${price}) user=${alert.userId}`);
+        recentlyTriggered.add(alert.id);
+        processTriggeredAlert(alert, price).catch(e => {
+          err(`processTriggeredAlert error: ${e.message}`);
+          recentlyTriggered.delete(alert.id);
+        });
+      }
+    } catch(e) { warn(`checkAlerts error for ${alert.id}: ${e.message}`); }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 9 — MINUTE BOUNDARY CANDLE CLOSE CHECKER
+// ════════════════════════════════════════════════════════════════════════════
 
 let lastCandleMinute = -1;
 
@@ -575,7 +727,6 @@ async function onMinuteClose() {
 
   const gateIntervals = { M1:'1m', M5:'5m', M15:'15m', H1:'1h' };
 
-  // Fetch candles for each closed timeframe from Gate.io
   for (const tf of closedTfs) {
     const interval = gateIntervals[tf];
     for (const [sym, gSym] of Object.entries(GATE_SYMBOLS)) {
@@ -600,7 +751,7 @@ async function onMinuteClose() {
     }
   }
 
-  // Yahoo — M1 only for indices + forex
+  // Yahoo M1 candle close for indices + forex
   for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
@@ -621,20 +772,17 @@ async function onMinuteClose() {
   }
 
   // Metals — Capital.com WebSocket stores OHLC in metalOhlc automatically
-
-  // Check alerts for all timeframes that just closed
   checkCandleCloseAlerts(closedTfs);
 }
+
 function checkCandleCloseAlerts(closedTfs) {
-  const all        = Object.values(activeAlerts);
-  const alertList  = all.filter(a => a.candleClose && closedTfs.includes(a.timeframe));
+  const all       = Object.values(activeAlerts);
+  const alertList = all.filter(a => a.candleClose && closedTfs.includes(a.timeframe));
 
   log(`  checkCandleCloseAlerts: ${all.length} total, ${alertList.length} match [${closedTfs.join(',')}]`);
-  // Debug: show all candle alerts and their timeframes
   all.filter(a => a.candleClose).forEach(a =>
     log(`    alert: ${a.pairSymbol} ${a.direction} ${a.targetPrice} tf=${a.timeframe} candleClose=${a.candleClose}`)
   );
-  if (!alertList.length) return;
 
   const nowMs = Date.now();
   for (const alert of alertList) {
@@ -665,12 +813,17 @@ function checkCandleCloseAlerts(closedTfs) {
   }
 }
 
-// Schedule minute-boundary checks — polls every second near the minute roll
+function getCandleClose(sym, tf) {
+  if (sym === 'XAU' || sym === 'XAG') {
+    const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
+    return metalOhlc[sym]?.[resMap[tf]]?.c || 0;
+  }
+  return m1Candle[sym]?.byTf?.[tf]?.close || 0;
+}
+
 function startMinuteBoundaryChecker() {
   setInterval(() => {
-    const ms    = Date.now();
-    const secMs = ms % 60000; // milliseconds into current minute
-    // Fire when we're in the first 3 seconds of a new minute
+    const secMs = Date.now() % 60000;
     if (secMs < 3000) {
       onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
     }
@@ -678,143 +831,7 @@ function startMinuteBoundaryChecker() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 6 — YAHOO FINANCE POLLING (Indices + Forex)
-// ════════════════════════════════════════════════════════════════════════════
-
-const YAHOO_SYMBOLS = {
-  SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5EIXIC',
-  DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
-  EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
-  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X', USDGBP: 'GBPUSD=X'
-};
-
-async function pollYahoo() {
-  for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
-    try {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=2m`;
-      const res = await fetchJson(url);
-      const meta  = res?.chart?.result?.[0]?.meta;
-      const price = parseFloat(meta?.regularMarketPrice) || 0;
-      if (price > 0) livePrice[sym] = price;
-
-      // For candle close alerts — get the last closed M1 candle
-      const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
-      const times  = res?.chart?.result?.[0]?.timestamp;
-      if (quotes && times && times.length >= 2) {
-        const i = times.length - 2; // second-to-last = last closed candle
-        if (quotes.close?.[i] != null) {
-          // Only update m1Candle close — used for candle-close alerts only
-          if (!m1Candle[sym]) m1Candle[sym] = {};
-          m1Candle[sym].close = quotes.close[i];
-        }
-      }
-    } catch(e) { /* skip, try next poll */ }
-  }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// SECTION 7 — CANDLE BUILDER (tick-based M1 for candle close alerts)
-// ════════════════════════════════════════════════════════════════════════════
-// Builds the current open M1 candle from live ticks.
-// When the minute rolls, the completed candle's close is saved to m1Candle.
-// Used ONLY for candle-close alerts — instant alerts use live price directly.
-
-function updateOpenCandle(sym, price) {
-  const nowMin = Math.floor(Date.now() / 60000);
-  if (!openCandle[sym]) {
-    openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
-    return;
-  }
-  const oc = openCandle[sym];
-  if (oc.startMin !== nowMin) {
-    // Minute rolled — save completed candle close, preserve byTf
-    const existingByTf = m1Candle[sym]?.byTf;
-    m1Candle[sym] = { high: oc.high, low: oc.low, close: oc.open, byTf: existingByTf || {} };
-    openCandle[sym] = { open: price, high: price, low: price, startMin: nowMin };
-  } else {
-    if (price > oc.high) oc.high = price;
-    if (price < oc.low)  oc.low  = price;
-  }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// SECTION 8 — PRICE ALERT CHECKER
-// ════════════════════════════════════════════════════════════════════════════
-
-// Server is stopped flag (matches RTDB worker_control/stop)
-let serverStopped = false;
-
-async function checkServerStopFlag() {
-  try {
-    const val = await rtdbGet('worker_control/stop');
-    serverStopped = val === true || val === 'true';
-    if (serverStopped) log('Server stop flag is TRUE — only dev alerts will be checked');
-  } catch(e) { /* keep current state */ }
-}
-
-let _checkCount = 0;
-function checkAlerts() {
-  _checkCount++;
-  const alertList = Object.values(activeAlerts);
-
-  // Log every 30 seconds so we know the checker is alive
-  if (_checkCount % 30 === 0) {
-    log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU}`);
-  }
-
-  if (!alertList.length) return;
-
-  const nowMs = Date.now();
-
-  for (const alert of alertList) {
-    try {
-      // Skip if already being processed
-      if (recentlyTriggered.has(alert.id)) continue;
-
-      // Server stopped — only process dev account
-      if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
-
-      // Skip candle-close alerts — handled by checkCandleCloseAlerts() at minute boundary
-      if (alert.candleClose) continue;
-
-      const price = livePrice[alert.pairSymbol];
-      if (!price || price <= 0) continue;
-
-      const target = parseFloat(alert.targetPrice);
-      if (!target) continue;
-
-      let hit      = false;
-      let hitPrice = price;
-
-      // ── Instant alert — live price check ───────────────────────────
-      if (alert.direction === 'above' && price >= target) { hit = true; }
-      if (alert.direction === 'below' && price <= target) { hit = true; }
-
-      if (hit) {
-        log(`🎯 Alert triggered: ${alert.pairSymbol} ${alert.direction} ${target} (price=${hitPrice}) user=${alert.userId}`);
-        recentlyTriggered.add(alert.id);
-        processTriggeredAlert(alert, hitPrice).catch(e => {
-          err(`processTriggeredAlert error: ${e.message}`);
-          recentlyTriggered.delete(alert.id);
-        });
-      }
-
-    } catch(e) { warn(`checkAlerts error for ${alert.id}: ${e.message}`); }
-  }
-}
-
-function getCandleClose(sym, tf) {
-  // Metals — Capital.com WebSocket OHLC
-  if (sym === 'XAU' || sym === 'XAG') {
-    const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    return metalOhlc[sym]?.[resMap[tf]]?.c || 0;
-  }
-  // Crypto (Gate.io) + Indices/Forex (Yahoo) — use byTf structure
-  return m1Candle[sym]?.byTf?.[tf]?.close || 0;
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// SECTION 9 — TRIGGER PROCESSING (FCM + Firestore + RTDB cleanup)
+// SECTION 10 — TRIGGER PROCESSING
 // ════════════════════════════════════════════════════════════════════════════
 
 async function processTriggeredAlert(alert, hitPrice) {
@@ -822,7 +839,6 @@ async function processTriggeredAlert(alert, hitPrice) {
   const userId  = alert.userId;
   const hitTime = Date.now();
 
-  // Remove from local cache immediately to prevent double-fire
   delete activeAlerts[alertId];
 
   // 1. Delete from RTDB
@@ -917,28 +933,28 @@ async function sendFCM(userId, alert, hitPrice) {
   const fcmToken = userDoc?.fields?.fcmToken?.stringValue;
   if (!fcmToken) { warn(`No FCM token for user ${userId}`); return; }
 
-  const isAlarm    = alert.alarm === true;
-  const hitType    = alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit';
-  const priceStr   = formatPrice(hitPrice, alert.pairSymbol);
-  const dirLabel   = alert.direction === 'above' ? '📈 Above' : '📉 Below';
+  const isAlarm  = alert.alarm === true;
+  const hitType  = alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit';
+  const priceStr = formatPrice(hitPrice, alert.pairSymbol);
+  const dirLabel = alert.direction === 'above' ? '📈 Above' : '📉 Below';
 
   const message = {
     message: {
       token: fcmToken,
       data: {
-        type:          'PRICE_ALERT',
-        alertId:       alert.id,
-        pairSymbol:    alert.pairSymbol,
-        pairName:      alert.pairName,
-        pairEmoji:     alert.pairEmoji || '',
-        targetPrice:   String(alert.targetPrice),
-        currentPrice:  String(hitPrice),
-        direction:     alert.direction,
-        isAlarm:       String(isAlarm),
+        type:         'PRICE_ALERT',
+        alertId:      alert.id,
+        pairSymbol:   alert.pairSymbol,
+        pairName:     alert.pairName,
+        pairEmoji:    alert.pairEmoji || '',
+        targetPrice:  String(alert.targetPrice),
+        currentPrice: String(hitPrice),
+        direction:    alert.direction,
+        isAlarm:      String(isAlarm),
         hitType,
-        hitTime:       String(Date.now()),
-        vibration:     String(alert.vibrationEnabled !== false),
-        sound:         String(alert.soundEnabled !== false),
+        hitTime:      String(Date.now()),
+        vibration:    String(alert.vibrationEnabled !== false),
+        sound:        String(alert.soundEnabled !== false),
       },
       notification: isAlarm ? undefined : {
         title: `${alert.pairEmoji || ''} ${alert.pairName} Alert`,
@@ -956,18 +972,14 @@ async function sendFCM(userId, alert, hitPrice) {
       body:    JSON.stringify(message)
     }
   );
-  if (res?.name) {
-    log(`  FCM sent to ${userId}: ${res.name}`);
-  } else {
-    warn(`  FCM response: ${JSON.stringify(res)}`);
-  }
+  if (res?.name) log(`  FCM sent to ${userId}: ${res.name}`);
+  else warn(`  FCM response: ${JSON.stringify(res)}`);
 }
 
 function formatPrice(price, sym) {
   if (!price) return '—';
-  if (sym === 'XAU' || sym === 'XAG' || YAHOO_SYMBOLS[sym]) {
+  if (sym === 'XAU' || sym === 'XAG' || YAHOO_SYMBOLS[sym])
     return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
   if (price < 0.01) return price.toFixed(8);
   if (price < 1)    return price.toFixed(4);
   if (price < 100)  return price.toFixed(2);
@@ -975,10 +987,9 @@ function formatPrice(price, sym) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 10 — RTDB LIVE PRICE UPDATES (for app mobile display)
+// SECTION 11 — RTDB PRICE UPDATES (for mobile app display)
 // ════════════════════════════════════════════════════════════════════════════
 
-// Write XAU/XAG current price to RTDB every 5s so mobile app can display it
 async function updateRtdbPrices() {
   if (!livePrice.XAU && !livePrice.XAG) return;
   try {
@@ -990,23 +1001,22 @@ async function updateRtdbPrices() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 11 — HEALTH SERVER (keeps Render alive)
+// SECTION 12 — HEALTH SERVER
 // ════════════════════════════════════════════════════════════════════════════
 
 function startHealthServer() {
   const port = process.env.PORT || 3000;
   http.createServer((req, res) => {
-    const alertCount  = Object.keys(activeAlerts).length;
-    const priceCount  = Object.values(livePrice).filter(p => p > 0).length;
     const status = {
-      ok:           true,
-      alerts:       alertCount,
-      prices:       `${priceCount}/${Object.keys(livePrice).length}`,
-      stopped:      serverStopped,
-      xau:          livePrice.XAU,
-      xag:          livePrice.XAG,
-      btc:          livePrice.BTC,
-      uptime:       Math.floor(process.uptime()),
+      ok:       true,
+      alerts:   Object.keys(activeAlerts).length,
+      prices:   `${Object.values(livePrice).filter(p => p > 0).length}/${Object.keys(livePrice).length}`,
+      stopped:  serverStopped,
+      gateWs:   gateWsConnected,
+      xau:      livePrice.XAU,
+      xag:      livePrice.XAG,
+      btc:      livePrice.BTC,
+      uptime:   Math.floor(process.uptime()),
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(status));
@@ -1020,7 +1030,6 @@ function startHealthServer() {
 async function main() {
   log('=== Trade Alert Server Starting ===');
 
-  // Validate env
   const required = ['CAP_EMAIL','CAP_PASSWORD','CAP_API_KEY','FIREBASE_URL',
                     'FIREBASE_SECRET','FIREBASE_PROJECT_ID','FIREBASE_SERVICE_ACCOUNT'];
   for (const k of required) {
@@ -1028,33 +1037,30 @@ async function main() {
   }
 
   startHealthServer();
-
-  // Start RTDB alert listener (SSE)
   startRtdbListener();
 
-  // Start Capital.com WebSocket
+  // Capital.com WebSocket for metals
   await createCapSession();
   connectCapWs();
-
-  // Ping Capital.com session every 9 minutes
   setInterval(pingCapSession, 9 * 60 * 1000);
 
-  // Poll Gate.io every 15 seconds for live crypto prices (individual symbols = small responses)
+  // Gate.io WebSocket for instant crypto prices
+  connectGateWs();
+  // REST fallback — only runs if WebSocket is disconnected
   setInterval(pollGateio, 15000);
-  pollGateio(); // immediate first poll
 
-  // Minute-boundary candle close checker — fires at start of each new minute
-  startMinuteBoundaryChecker();
-
-  // Poll Yahoo Finance every 30 seconds for indices + forex
+  // Yahoo Finance polling every 30 seconds for indices + forex
   setInterval(pollYahoo, 30000);
   pollYahoo();
 
-  // Update RTDB prices every 5 seconds (for mobile app display)
+  // Update RTDB prices every 5 seconds for mobile display
   setInterval(updateRtdbPrices, 5000);
 
-  // Check alerts every second
+  // Check instant alerts every second
   setInterval(checkAlerts, 1000);
+
+  // Minute-boundary candle close checker
+  startMinuteBoundaryChecker();
 
   // Check server stop flag every minute
   setInterval(checkServerStopFlag, 60000);
