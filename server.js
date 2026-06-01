@@ -688,7 +688,11 @@ function checkAlerts() {
   const alertList = Object.values(activeAlerts);
 
   if (_checkCount % 30 === 0) {
-    log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU}`);
+    log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU} EURUSD=${livePrice.EURUSD}`);
+    // Show all active instant alerts for debugging
+    alertList.filter(a => !a.candleClose).forEach(a =>
+      log(`  active: ${a.pairSymbol} ${a.direction} ${a.targetPrice} price=${livePrice[a.pairSymbol]}`)
+    );
   }
   if (!alertList.length) return;
 
