@@ -209,7 +209,8 @@ async function firestoreDelete(path) {
  * This gives us real-time add/remove/change events without polling.
  */
 function startRtdbListener() {
-  log('Starting RTDB alerts listener...');
+  const rtdbUrl = FIREBASE_URL || 'NOT SET';
+  log(`Starting RTDB alerts listener on: ${rtdbUrl}/alerts`);
 
   const url = `${FIREBASE_URL}/alerts.json?auth=${FIREBASE_SECRET}&stream=true`;
   const u   = new URL(url);
@@ -324,9 +325,10 @@ function handleRtdbEvent(event, data) {
     } else if (parts.length === 2) {
       const [userId, alertId] = parts;
       if (value === null) {
-        // Alert deleted
+        // Alert deleted — log with stack trace context
+        const known = activeAlerts[alertId];
+        log(`RTDB alert removed: ${alertId}${known ? ` (${known.pairSymbol} ${known.direction} ${known.targetPrice})` : ' (not in cache)'}`);
         delete activeAlerts[alertId];
-        log(`RTDB alert removed: ${alertId}`);
       } else {
         // Alert added or updated
         activeAlerts[alertId] = { ...value, userId };
@@ -777,20 +779,32 @@ async function onMinuteClose() {
   for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
-      const res = await fetchJson(url);
+      const res = await fetchJson(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json'
+        }
+      });
       const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
       const times  = res?.chart?.result?.[0]?.timestamp;
       if (quotes && times && times.length >= 2) {
-        const i = times.length - 2;
+        const i     = times.length - 2;
         const close = quotes.close?.[i] || 0;
         if (close > 0) {
-          if (!m1Candle[sym])       m1Candle[sym]       = {};
-          if (!m1Candle[sym].byTf)  m1Candle[sym].byTf  = {};
+          if (!m1Candle[sym])      m1Candle[sym]      = {};
+          if (!m1Candle[sym].byTf) m1Candle[sym].byTf = {};
           m1Candle[sym].byTf['M1'] = { close, high: quotes.high?.[i]||0, low: quotes.low?.[i]||0 };
           m1Candle[sym].close = close;
+          if (sym === 'EURUSD') log(`  EURUSD M1 candle close: ${close}`);
+        } else {
+          if (sym === 'EURUSD') warn(`  EURUSD M1 close=0, raw closes: ${JSON.stringify(quotes.close)}`);
         }
+      } else {
+        if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle: no data. times=${times?.length} quotes=${!!quotes} raw=${JSON.stringify(res).slice(0,150)}`);
       }
-    } catch(e) { /* skip */ }
+    } catch(e) {
+      if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle error: ${e.message}`);
+    }
   }
 
   // Metals — Capital.com WebSocket stores OHLC in metalOhlc automatically
