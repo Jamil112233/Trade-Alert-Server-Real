@@ -618,15 +618,33 @@ const YAHOO_SYMBOLS = {
 };
 
 async function pollYahoo() {
+  let updated = 0;
   for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=2m`;
-      const res = await fetchJson(url);
+      const res = await fetchJson(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+          'Accept-Language': 'en-US,en;q=0.9'
+        }
+      });
       const meta  = res?.chart?.result?.[0]?.meta;
       const price = parseFloat(meta?.regularMarketPrice) || 0;
-      if (price > 0) livePrice[sym] = price;
-    } catch(e) { /* skip */ }
+      if (price > 0) {
+        livePrice[sym] = price;
+        updated++;
+      } else {
+        // Log error details for EURUSD to debug
+        if (sym === 'EURUSD') {
+          warn(`Yahoo EURUSD failed — response: ${JSON.stringify(res).slice(0, 200)}`);
+        }
+      }
+    } catch(e) {
+      if (sym === 'EURUSD') warn(`Yahoo EURUSD error: ${e.message}`);
+    }
   }
+  log(`Yahoo: ${updated}/${Object.keys(YAHOO_SYMBOLS).length} updated. EURUSD=${livePrice.EURUSD} SPX500=${livePrice.SPX500}`);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1049,8 +1067,8 @@ async function main() {
   // REST fallback — only runs if WebSocket is disconnected
   setInterval(pollGateio, 15000);
 
-  // Yahoo Finance polling every 30 seconds for indices + forex
-  setInterval(pollYahoo, 30000);
+  // Yahoo Finance polling every 15 seconds for indices + forex
+  setInterval(pollYahoo, 15000);
   pollYahoo();
 
   // Update RTDB prices every 5 seconds for mobile display
