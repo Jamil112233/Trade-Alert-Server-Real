@@ -787,17 +787,29 @@ async function onMinuteClose() {
       });
       const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
       const times  = res?.chart?.result?.[0]?.timestamp;
-      if (quotes && times && times.length >= 2) {
-        const i     = times.length - 2;
-        const close = quotes.close?.[i] || 0;
+      if (quotes && times && times.length >= 1) {
+        // Find the last non-null close — Yahoo sometimes returns null for recent candles
+        let close = 0;
+        let closeIdx = -1;
+        for (let i = quotes.close.length - 1; i >= 0; i--) {
+          if (quotes.close[i] != null && quotes.close[i] > 0) {
+            close    = quotes.close[i];
+            closeIdx = i;
+            break;
+          }
+        }
         if (close > 0) {
           if (!m1Candle[sym])      m1Candle[sym]      = {};
           if (!m1Candle[sym].byTf) m1Candle[sym].byTf = {};
-          m1Candle[sym].byTf['M1'] = { close, high: quotes.high?.[i]||0, low: quotes.low?.[i]||0 };
+          m1Candle[sym].byTf['M1'] = {
+            close,
+            high: quotes.high?.[closeIdx]  || 0,
+            low:  quotes.low?.[closeIdx]   || 0
+          };
           m1Candle[sym].close = close;
-          if (sym === 'EURUSD') log(`  EURUSD M1 candle close: ${close}`);
+          if (sym === 'EURUSD') log(`  EURUSD M1 candle close: ${close} (idx=${closeIdx})`);
         } else {
-          if (sym === 'EURUSD') warn(`  EURUSD M1 close=0, raw closes: ${JSON.stringify(quotes.close)}`);
+          if (sym === 'EURUSD') warn(`  EURUSD M1 all closes null: ${JSON.stringify(quotes.close)}`);
         }
       } else {
         if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle: no data. times=${times?.length} quotes=${!!quotes} raw=${JSON.stringify(res).slice(0,150)}`);
