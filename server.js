@@ -1,16 +1,25 @@
 /**
- * Trade Alert — Combined Server
+ * Trade Alert — Combined Server (Bandwidth-Optimized)
  * Runs 24/7 on Render (Web Service, port required).
  *
  * Replaces:  price-bridge.js  +  Cloudflare Worker
  *
  * Flow:
- *   1. Capital.com WebSocket  → live XAU/XAG prices + OHLC candles
- *   2. MEXC WebSocket         → live crypto prices
- *   3. Yahoo Finance polling  → indices + forex (every 10s, no WebSocket)
+ *   1. Capital.com WebSocket  → live XAU/XAG prices + OHLC candles (only if XAU/XAG alert active)
+ *   2. Gate.io WebSocket      → live crypto prices (only subscribed pairs that have active alerts)
+ *   3. Yahoo Finance polling  → indices + forex every 20s (only pairs with active alerts, market hours only)
  *   4. RTDB listener          → watches alerts node, maintains live alert cache
+ *                               triggers Gate.io resubscribe when alert set changes
  *   5. Price checker          → every second, checks all cached alerts vs live prices
  *   6. On trigger             → FCM → delete RTDB alert → update Firestore
+ *
+ * Bandwidth optimizations:
+ *   - Gate.io WS: subscribes only to pairs that have at least one active alert
+ *   - Yahoo: polls only symbols with active alerts, skips closed markets by session hours
+ *   - Yahoo: 20s interval instead of 10s
+ *   - Gate.io candle REST: only fetches pairs with active candle-close alerts
+ *   - Weekend mode: forex/indices markets are closed Sat/Sun — skip Yahoo entirely
+ *   - Capital.com WS: already limited to GOLD + SILVER only
  *
  * Environment variables (set in Render dashboard):
  *   CAP_EMAIL, CAP_PASSWORD, CAP_API_KEY         — Capital.com credentials
@@ -73,6 +82,86 @@ const activeAlerts = {};
 
 // Track recently triggered to prevent double-fire
 const recentlyTriggered = new Set();
+
+// ── Active pair tracking ──────────────────────────────────────────────────────
+// Derived from activeAlerts — updated whenever RTDB pushes alert changes.
+// Gate.io WS subscribes ONLY to pairs in this set; Yahoo polls ONLY these.
+// Populated after GATE_SYMBOLS / YAHOO_SYMBOLS are defined (below Section 5/6).
+const GATE_SYMBOLS_SET   = new Set(); // filled at startup
+const YAHOO_SYMBOLS_KEYS = new Set(); // filled at startup
+
+function getActiveCryptoPairs() {
+  const pairs = new Set();
+  for (const alert of Object.values(activeAlerts)) {
+    if (GATE_SYMBOLS_SET.has(alert.pairSymbol)) pairs.add(alert.pairSymbol);
+  }
+  return pairs;
+}
+
+function getActiveYahooPairs() {
+  const pairs = new Set();
+  for (const alert of Object.values(activeAlerts)) {
+    if (YAHOO_SYMBOLS_KEYS.has(alert.pairSymbol)) pairs.add(alert.pairSymbol);
+  }
+  return pairs;
+}
+
+// Crypto pairs that need candle REST fetches at minute boundary for a given timeframe
+function getActiveCandleCloseCryptoPairs(tf) {
+  const pairs = new Set();
+  for (const alert of Object.values(activeAlerts)) {
+    if (alert.candleClose && alert.timeframe === tf && GATE_SYMBOLS_SET.has(alert.pairSymbol)) {
+      pairs.add(alert.pairSymbol);
+    }
+  }
+  return pairs;
+}
+
+// ── Market hours helpers ──────────────────────────────────────────────────────
+// All times in UTC. Returns true if the market for that symbol is currently open.
+
+const INDEX_HOURS_UTC = {
+  // NYSE/NASDAQ: Mon-Fri 13:30–20:00 UTC
+  SPX500: { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
+  US30:   { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
+  US100:  { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
+  // DXY: Mon-Fri 00:00–21:00 UTC (ICE)
+  DXY:    { days: [1,2,3,4,5], open: 0,         close: 21*60 },
+  // NSE India: Mon-Fri 03:45–10:00 UTC
+  NIF50:  { days: [1,2,3,4,5], open: 3*60+45,  close: 10*60 },
+};
+
+const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP']);
+
+function isWeekend() {
+  const day = new Date().getUTCDay(); // 0=Sun, 6=Sat
+  return day === 0 || day === 6;
+}
+
+function isForexOpen() {
+  // Forex is open Mon 00:00 UTC through Fri 21:00 UTC (approximately)
+  if (isWeekend()) return false;
+  const now = new Date();
+  const day  = now.getUTCDay();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (day === 5 && mins >= 21*60) return false; // Friday after 21:00 UTC
+  return true;
+}
+
+function isIndexOpen(sym) {
+  if (isWeekend()) return false;
+  const h = INDEX_HOURS_UTC[sym];
+  if (!h) return false;
+  const now  = new Date();
+  const day  = now.getUTCDay();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return h.days.includes(day) && mins >= h.open && mins < h.close;
+}
+
+function isYahooSymbolOpen(sym) {
+  if (FOREX_PAIRS.has(sym)) return isForexOpen();
+  return isIndexOpen(sym);
+}
 
 // ── OAuth token cache ────────────────────────────────────────────────────────
 let _oauthToken = null;
@@ -299,6 +388,7 @@ function handleRtdbEvent(event, data) {
         }
       }
       log(`RTDB initial load: ${Object.keys(activeAlerts).length} active alerts`);
+      scheduleGateResubscribe();
       return;
     }
 
@@ -321,6 +411,7 @@ function handleRtdbEvent(event, data) {
         }
       }
       log(`RTDB user ${userId} alerts reloaded: ${Object.keys(activeAlerts).filter(k => activeAlerts[k].userId === userId).length} alerts`);
+      scheduleGateResubscribe();
 
     } else if (parts.length === 2) {
       const [userId, alertId] = parts;
@@ -329,10 +420,12 @@ function handleRtdbEvent(event, data) {
         const known = activeAlerts[alertId];
         log(`RTDB alert removed: ${alertId}${known ? ` (${known.pairSymbol} ${known.direction} ${known.targetPrice})` : ' (not in cache)'}`);
         delete activeAlerts[alertId];
+        scheduleGateResubscribe();
       } else {
         // Alert added or updated
         activeAlerts[alertId] = { ...value, userId };
         log(`RTDB alert added: ${alertId} (${value.pairSymbol} ${value.direction} ${value.targetPrice})`);
+        scheduleGateResubscribe();
       }
     }
 
@@ -518,7 +611,10 @@ const GATE_SYMBOLS = {
 };
 
 const GATE_REVERSE = {};
-for (const [sym, gs] of Object.entries(GATE_SYMBOLS)) GATE_REVERSE[gs] = sym;
+for (const [sym, gs] of Object.entries(GATE_SYMBOLS)) {
+  GATE_REVERSE[gs] = sym;
+  GATE_SYMBOLS_SET.add(sym); // populate the active-pair helper set
+}
 
 const MEXC_SYMBOLS = {
   BTC:'BTCUSDT', ETH:'ETHUSDT', BNB:'BNBUSDT', SOL:'SOLUSDT',
@@ -531,21 +627,86 @@ const MEXC_SYMBOLS = {
 let gateWs = null;
 let gateWsConnected = false;
 
-function connectGateWs() {
-  log('Connecting Gate.io WebSocket...');
-  gateWs = new WebSocket('wss://api.gateio.ws/ws/v4/');
+// Tracks which Gate pairs are currently subscribed on the open WS
+let gateSubscribedPairs = new Set();
 
-  gateWs.on('open', () => {
-    log('Gate.io WebSocket connected');
-    gateWsConnected = true;
+// Debounce resubscribe so rapid alert add/remove (e.g. batch load) only triggers once
+let _gateResubTimer = null;
+function scheduleGateResubscribe() {
+  if (_gateResubTimer) clearTimeout(_gateResubTimer);
+  _gateResubTimer = setTimeout(() => {
+    _gateResubTimer = null;
+    syncGateSubscriptions();
+  }, 2000); // 2s debounce
+}
 
-    const tickers = Object.values(GATE_SYMBOLS);
+/**
+ * Compares currently-subscribed Gate pairs vs pairs that have active alerts.
+ * Sends unsubscribe for pairs no longer needed, subscribe for new ones.
+ * Much cheaper than reconnecting the whole WebSocket.
+ */
+function syncGateSubscriptions() {
+  if (!gateWs || gateWs.readyState !== WebSocket.OPEN) return;
+
+  const needed = getActiveCryptoPairs(); // Set of syms like 'BTC', 'ETH'
+
+  // Unsubscribe pairs no longer needed
+  const toUnsub = [...gateSubscribedPairs].filter(s => !needed.has(s));
+  if (toUnsub.length > 0) {
+    const tickers = toUnsub.map(s => GATE_SYMBOLS[s]);
+    gateWs.send(JSON.stringify({
+      time:    Math.floor(Date.now() / 1000),
+      channel: 'spot.tickers',
+      event:   'unsubscribe',
+      payload: tickers
+    }));
+    toUnsub.forEach(s => gateSubscribedPairs.delete(s));
+    log(`Gate.io WS unsubscribed ${toUnsub.length} pairs: ${toUnsub.join(', ')}`);
+  }
+
+  // Subscribe to new needed pairs
+  const toSub = [...needed].filter(s => !gateSubscribedPairs.has(s));
+  if (toSub.length > 0) {
+    const tickers = toSub.map(s => GATE_SYMBOLS[s]);
     gateWs.send(JSON.stringify({
       time:    Math.floor(Date.now() / 1000),
       channel: 'spot.tickers',
       event:   'subscribe',
       payload: tickers
     }));
+    toSub.forEach(s => gateSubscribedPairs.add(s));
+    log(`Gate.io WS subscribed ${toSub.length} pairs: ${toSub.join(', ')}`);
+  }
+
+  if (toUnsub.length === 0 && toSub.length === 0) {
+    log(`Gate.io WS subscriptions unchanged (${gateSubscribedPairs.size} pairs)`);
+  }
+}
+
+function connectGateWs() {
+  log('Connecting Gate.io WebSocket...');
+  gateWs = new WebSocket('wss://api.gateio.ws/ws/v4/');
+
+  gateWs.on('open', () => {
+    log('Gate.io WebSocket connected');
+    gateWsConnected  = true;
+    gateSubscribedPairs = new Set();
+
+    // Subscribe only to pairs that currently have active alerts
+    const needed = getActiveCryptoPairs();
+    if (needed.size > 0) {
+      const tickers = [...needed].map(s => GATE_SYMBOLS[s]);
+      gateWs.send(JSON.stringify({
+        time:    Math.floor(Date.now() / 1000),
+        channel: 'spot.tickers',
+        event:   'subscribe',
+        payload: tickers
+      }));
+      needed.forEach(s => gateSubscribedPairs.add(s));
+      log(`Gate.io WS initial subscribe: ${tickers.length} pairs (${[...needed].join(', ')})`);
+    } else {
+      log('Gate.io WS connected — no active crypto alerts, not subscribing yet');
+    }
 
     if (gateWs._ping) clearInterval(gateWs._ping);
     gateWs._ping = setInterval(() => {
@@ -558,9 +719,8 @@ function connectGateWs() {
   gateWs.on('message', data => {
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.event === 'subscribe') {
-        if (msg.error) warn(`Gate.io WS subscribe error: ${JSON.stringify(msg.error)}`);
-        else log(`Gate.io WS subscribed: ${msg.channel}`);
+      if (msg.event === 'subscribe' || msg.event === 'unsubscribe') {
+        if (msg.error) warn(`Gate.io WS ${msg.event} error: ${JSON.stringify(msg.error)}`);
         return;
       }
       if (msg.channel === 'spot.pong') return;
@@ -578,6 +738,7 @@ function connectGateWs() {
 
   gateWs.on('close', (code) => {
     gateWsConnected = false;
+    gateSubscribedPairs = new Set();
     if (gateWs._ping) { clearInterval(gateWs._ping); gateWs._ping = null; }
     warn(`Gate.io WS closed ${code} — reconnecting in 5s`);
     setTimeout(connectGateWs, 5000);
@@ -589,9 +750,12 @@ function connectGateWs() {
 // Fallback REST polling — only runs if WebSocket is not connected
 async function pollGateio() {
   if (gateWsConnected) return;
+  const needed = getActiveCryptoPairs();
+  if (needed.size === 0) return;
   try {
     const results = await Promise.all(
-      Object.entries(GATE_SYMBOLS).map(async ([sym, gSym]) => {
+      [...needed].map(async sym => {
+        const gSym = GATE_SYMBOLS[sym];
         try {
           const res    = await fetchJson(`https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${gSym}`);
           const ticker = Array.isArray(res) ? res[0] : res;
@@ -604,7 +768,7 @@ async function pollGateio() {
     for (const { sym, price } of results) {
       if (price > 0) { livePrice[sym] = price; updateOpenCandle(sym, price); updated++; }
     }
-    if (updated > 0) log(`Gate.io REST fallback: ${updated} prices. BTC=${livePrice.BTC}`);
+    if (updated > 0) log(`Gate.io REST fallback: ${updated}/${needed.size} prices. BTC=${livePrice.BTC}`);
   } catch(e) { warn(`Gate.io REST fallback error: ${e.message}`); }
 }
 
@@ -619,9 +783,32 @@ const YAHOO_SYMBOLS = {
   GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X', USDGBP: 'GBPUSD=X'
 };
 
+// Populate helper set for active pair tracking
+for (const sym of Object.keys(YAHOO_SYMBOLS)) YAHOO_SYMBOLS_KEYS.add(sym);
+
 async function pollYahoo() {
+  // Fix 6: Skip entirely on weekends — forex and indices are both closed
+  if (isWeekend()) {
+    log('Yahoo: skipping — weekend, markets closed');
+    return;
+  }
+
+  // Fix 2: Only poll pairs that have at least one active alert AND whose market is open
+  const activeYahoo = getActiveYahooPairs();
+  if (activeYahoo.size === 0) {
+    log('Yahoo: no active forex/index alerts — skipping');
+    return;
+  }
+
+  const toFetch = [...activeYahoo].filter(sym => isYahooSymbolOpen(sym));
+  if (toFetch.length === 0) {
+    log(`Yahoo: ${activeYahoo.size} active alerts but all markets currently closed — skipping`);
+    return;
+  }
+
   let updated = 0;
-  for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
+  for (const sym of toFetch) {
+    const yahooSym = YAHOO_SYMBOLS[sym];
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=2m`;
       const res = await fetchJson(url, {
@@ -637,7 +824,6 @@ async function pollYahoo() {
         livePrice[sym] = price;
         updated++;
       } else {
-        // Log error details for EURUSD to debug
         if (sym === 'EURUSD') {
           warn(`Yahoo EURUSD failed — response: ${JSON.stringify(res).slice(0, 200)}`);
         }
@@ -646,7 +832,7 @@ async function pollYahoo() {
       if (sym === 'EURUSD') warn(`Yahoo EURUSD error: ${e.message}`);
     }
   }
-  log(`Yahoo: ${updated}/${Object.keys(YAHOO_SYMBOLS).length} updated. EURUSD=${livePrice.EURUSD} SPX500=${livePrice.SPX500}`);
+  log(`Yahoo: ${updated}/${toFetch.length} updated (${toFetch.join(', ')}). EURUSD=${livePrice.EURUSD} SPX500=${livePrice.SPX500}`);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -751,9 +937,18 @@ async function onMinuteClose() {
 
   const gateIntervals = { M1:'1m', M5:'5m', M15:'15m', H1:'1h' };
 
+  // Fix 5: Only fetch candle data for pairs that have active candle-close alerts for this TF
   for (const tf of closedTfs) {
-    const interval = gateIntervals[tf];
-    for (const [sym, gSym] of Object.entries(GATE_SYMBOLS)) {
+    const interval     = gateIntervals[tf];
+    const activePairs  = getActiveCandleCloseCryptoPairs(tf);
+
+    if (activePairs.size === 0) {
+      log(`  No active candle-close alerts for ${tf} — skipping Gate.io candle fetch`);
+      continue;
+    }
+
+    for (const sym of activePairs) {
+      const gSym = GATE_SYMBOLS[sym];
       try {
         const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}&interval=${interval}&limit=2`;
         const res = await fetchJson(url);
@@ -775,47 +970,52 @@ async function onMinuteClose() {
     }
   }
 
-  // Yahoo M1 candle close for indices + forex
-  for (const [sym, yahooSym] of Object.entries(YAHOO_SYMBOLS)) {
-    try {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
-      const res = await fetchJson(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json'
-        }
-      });
-      const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
-      const times  = res?.chart?.result?.[0]?.timestamp;
-      if (quotes && times && times.length >= 1) {
-        // Find the last non-null close — Yahoo sometimes returns null for recent candles
-        let close = 0;
-        let closeIdx = -1;
-        for (let i = quotes.close.length - 1; i >= 0; i--) {
-          if (quotes.close[i] != null && quotes.close[i] > 0) {
-            close    = quotes.close[i];
-            closeIdx = i;
-            break;
+  // Yahoo M1 candle close for indices + forex — only active pairs, market hours only
+  if (!isWeekend()) {
+    const activeYahoo = getActiveYahooPairs();
+    const toFetch     = [...activeYahoo].filter(sym => isYahooSymbolOpen(sym));
+
+    for (const sym of toFetch) {
+      const yahooSym = YAHOO_SYMBOLS[sym];
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
+        const res = await fetchJson(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json'
           }
-        }
-        if (close > 0) {
-          if (!m1Candle[sym])      m1Candle[sym]      = {};
-          if (!m1Candle[sym].byTf) m1Candle[sym].byTf = {};
-          m1Candle[sym].byTf['M1'] = {
-            close,
-            high: quotes.high?.[closeIdx]  || 0,
-            low:  quotes.low?.[closeIdx]   || 0
-          };
-          m1Candle[sym].close = close;
-          if (sym === 'EURUSD') log(`  EURUSD M1 candle close: ${close} (idx=${closeIdx})`);
+        });
+        const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
+        const times  = res?.chart?.result?.[0]?.timestamp;
+        if (quotes && times && times.length >= 1) {
+          let close = 0;
+          let closeIdx = -1;
+          for (let i = quotes.close.length - 1; i >= 0; i--) {
+            if (quotes.close[i] != null && quotes.close[i] > 0) {
+              close    = quotes.close[i];
+              closeIdx = i;
+              break;
+            }
+          }
+          if (close > 0) {
+            if (!m1Candle[sym])      m1Candle[sym]      = {};
+            if (!m1Candle[sym].byTf) m1Candle[sym].byTf = {};
+            m1Candle[sym].byTf['M1'] = {
+              close,
+              high: quotes.high?.[closeIdx]  || 0,
+              low:  quotes.low?.[closeIdx]   || 0
+            };
+            m1Candle[sym].close = close;
+            if (sym === 'EURUSD') log(`  EURUSD M1 candle close: ${close} (idx=${closeIdx})`);
+          } else {
+            if (sym === 'EURUSD') warn(`  EURUSD M1 all closes null: ${JSON.stringify(quotes.close)}`);
+          }
         } else {
-          if (sym === 'EURUSD') warn(`  EURUSD M1 all closes null: ${JSON.stringify(quotes.close)}`);
+          if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle: no data. times=${times?.length} quotes=${!!quotes} raw=${JSON.stringify(res).slice(0,150)}`);
         }
-      } else {
-        if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle: no data. times=${times?.length} quotes=${!!quotes} raw=${JSON.stringify(res).slice(0,150)}`);
+      } catch(e) {
+        if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle error: ${e.message}`);
       }
-    } catch(e) {
-      if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle error: ${e.message}`);
     }
   }
 
@@ -1056,15 +1256,17 @@ function startHealthServer() {
   const port = process.env.PORT || 3000;
   http.createServer((req, res) => {
     const status = {
-      ok:       true,
-      alerts:   Object.keys(activeAlerts).length,
-      prices:   `${Object.values(livePrice).filter(p => p > 0).length}/${Object.keys(livePrice).length}`,
-      stopped:  serverStopped,
-      gateWs:   gateWsConnected,
-      xau:      livePrice.XAU,
-      xag:      livePrice.XAG,
-      btc:      livePrice.BTC,
-      uptime:   Math.floor(process.uptime()),
+      ok:          true,
+      alerts:      Object.keys(activeAlerts).length,
+      prices:      `${Object.values(livePrice).filter(p => p > 0).length}/${Object.keys(livePrice).length}`,
+      stopped:     serverStopped,
+      gateWs:      gateWsConnected,
+      gatePairs:   gateSubscribedPairs.size,
+      weekend:     isWeekend(),
+      xau:         livePrice.XAU,
+      xag:         livePrice.XAG,
+      btc:         livePrice.BTC,
+      uptime:      Math.floor(process.uptime()),
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(status));
@@ -1097,8 +1299,8 @@ async function main() {
   // REST fallback — only runs if WebSocket is disconnected
   setInterval(pollGateio, 15000);
 
-  // Yahoo Finance polling every 15 seconds for indices + forex
-  setInterval(pollYahoo, 15000);
+  // Yahoo Finance polling every 20 seconds for indices + forex (active pairs + market hours only)
+  setInterval(pollYahoo, 20000);
   pollYahoo();
 
   // Update RTDB prices every 5 seconds for mobile display
