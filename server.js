@@ -881,9 +881,11 @@ function checkAlerts() {
   if (_checkCount % 30 === 0) {
     log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU} EURUSD=${livePrice.EURUSD}`);
     // Show all active instant alerts for debugging
-    alertList.filter(a => !a.candleClose).forEach(a =>
-      log(`  active: ${a.pairSymbol} ${a.direction} ${a.targetPrice} price=${livePrice[a.pairSymbol]}`)
-    );
+    alertList.filter(a => !a.candleClose).forEach(a => {
+      const p   = livePrice[a.pairSymbol];
+      const mkt = (p && p > 0) ? '' : (isYahooSymbolOpen(a.pairSymbol) === false ? ' [market closed]' : ' [no price yet]');
+      log(`  active: ${a.pairSymbol} ${a.direction} ${a.targetPrice} price=${p || 0}${mkt}`);
+    });
   }
   if (!alertList.length) return;
 
@@ -986,6 +988,12 @@ async function onMinuteClose() {
       const yahooSym = YAHOO_SYMBOLS[sym];
 
       for (const tf of closedTfs) {
+        // Only fetch if there's at least one candle-close alert for this sym+tf
+        // (instant alerts don't need candle data)
+        const hasCandleAlert = Object.values(activeAlerts).some(
+          a => a.candleClose && a.timeframe === tf && a.pairSymbol === sym
+        );
+        if (!hasCandleAlert) continue;
         const interval = yahooIntervalMap[tf];
         const range    = yahooRangeMap[tf];
         try {
