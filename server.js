@@ -66,7 +66,7 @@ const livePrice = {
   ARB:0, OP:0, SHIB:0, TRX:0,
   // Indices + Forex (from Yahoo polling)
   SPX500:0, US30:0, US100:0, DXY:0, NIF50:0,
-  EURUSD:0, GBPUSD:0, USDJPY:0, GBPJPY:0, AUDUSD:0, USDGBP:0,
+  EURUSD:0, GBPUSD:0, USDJPY:0, GBPJPY:0, AUDUSD:0, USDGBP:0, // USDGBP derived as 1/GBPUSD
 };
 
 // M1 OHLC for miss-hit detection (previous closed candle high/low)
@@ -780,11 +780,13 @@ const YAHOO_SYMBOLS = {
   SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5EIXIC',
   DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
   EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
-  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X', USDGBP: 'GBPUSD=X'
+  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X'
+  // USDGBP is derived from GBPUSD (1/GBPUSD) — not a separate Yahoo fetch
 };
 
-// Populate helper set for active pair tracking
+// Populate helper set for active pair tracking (USDGBP excluded — derived from GBPUSD)
 for (const sym of Object.keys(YAHOO_SYMBOLS)) YAHOO_SYMBOLS_KEYS.add(sym);
+YAHOO_SYMBOLS_KEYS.delete('USDGBP');
 
 async function pollYahoo() {
   // Fix 6: Skip entirely on weekends — forex and indices are both closed
@@ -822,6 +824,7 @@ async function pollYahoo() {
       const price = parseFloat(meta?.regularMarketPrice) || 0;
       if (price > 0) {
         livePrice[sym] = price;
+        if (sym === 'GBPUSD' && price > 0) livePrice.USDGBP = parseFloat((1 / price).toFixed(6));
         updated++;
       } else {
         if (sym === 'EURUSD') {
@@ -970,51 +973,57 @@ async function onMinuteClose() {
     }
   }
 
-  // Yahoo M1 candle close for indices + forex — only active pairs, market hours only
+  // Yahoo candle close for indices + forex — only active pairs, market hours only
+  // Fetches the right interval per TF so M5/M15/H1 candle-close alerts work correctly.
   if (!isWeekend()) {
     const activeYahoo = getActiveYahooPairs();
     const toFetch     = [...activeYahoo].filter(sym => isYahooSymbolOpen(sym));
 
+    const yahooIntervalMap = { M1: '1m', M5: '5m', M15: '15m', H1: '60m' };
+    const yahooRangeMap    = { M1: '5m', M5: '30m', M15: '2h', H1: '2d' };
+
     for (const sym of toFetch) {
       const yahooSym = YAHOO_SYMBOLS[sym];
-      try {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=1m&range=5m`;
-        const res = await fetchJson(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json'
-          }
-        });
-        const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
-        const times  = res?.chart?.result?.[0]?.timestamp;
-        if (quotes && times && times.length >= 1) {
-          let close = 0;
-          let closeIdx = -1;
-          for (let i = quotes.close.length - 1; i >= 0; i--) {
-            if (quotes.close[i] != null && quotes.close[i] > 0) {
-              close    = quotes.close[i];
-              closeIdx = i;
-              break;
+
+      for (const tf of closedTfs) {
+        const interval = yahooIntervalMap[tf];
+        const range    = yahooRangeMap[tf];
+        try {
+          const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSym}?interval=${interval}&range=${range}`;
+          const res = await fetchJson(url, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'application/json'
             }
-          }
-          if (close > 0) {
-            if (!m1Candle[sym])      m1Candle[sym]      = {};
-            if (!m1Candle[sym].byTf) m1Candle[sym].byTf = {};
-            m1Candle[sym].byTf['M1'] = {
-              close,
-              high: quotes.high?.[closeIdx]  || 0,
-              low:  quotes.low?.[closeIdx]   || 0
-            };
-            m1Candle[sym].close = close;
-            if (sym === 'EURUSD') log(`  EURUSD M1 candle close: ${close} (idx=${closeIdx})`);
+          });
+          const quotes = res?.chart?.result?.[0]?.indicators?.quote?.[0];
+          const times  = res?.chart?.result?.[0]?.timestamp;
+          if (quotes && times && times.length >= 1) {
+            let close = 0, closeIdx = -1;
+            for (let i = quotes.close.length - 1; i >= 0; i--) {
+              if (quotes.close[i] != null && quotes.close[i] > 0) {
+                close = quotes.close[i]; closeIdx = i; break;
+              }
+            }
+            if (close > 0) {
+              if (!m1Candle[sym])      m1Candle[sym]      = {};
+              if (!m1Candle[sym].byTf) m1Candle[sym].byTf = {};
+              m1Candle[sym].byTf[tf] = {
+                close,
+                high: quotes.high?.[closeIdx] || 0,
+                low:  quotes.low?.[closeIdx]  || 0
+              };
+              if (tf === 'M1') m1Candle[sym].close = close;
+              log(`  ${sym} ${tf} Yahoo candle close: ${close}`);
+            } else {
+              warn(`  ${sym} ${tf} Yahoo candle: all closes null`);
+            }
           } else {
-            if (sym === 'EURUSD') warn(`  EURUSD M1 all closes null: ${JSON.stringify(quotes.close)}`);
+            warn(`  ${sym} ${tf} Yahoo candle: no data. times=${times?.length}`);
           }
-        } else {
-          if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle: no data. times=${times?.length} quotes=${!!quotes} raw=${JSON.stringify(res).slice(0,150)}`);
+        } catch(e) {
+          warn(`  ${sym} ${tf} Yahoo candle error: ${e.message}`);
         }
-      } catch(e) {
-        if (sym === 'EURUSD') warn(`  EURUSD Yahoo candle error: ${e.message}`);
       }
     }
   }
