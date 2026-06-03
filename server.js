@@ -1158,11 +1158,7 @@ async function processTriggeredAlert(alert, hitPrice) {
     else log(`  Firestore history written: ${alertId}`);
   } catch(e) { warn(`  Firestore history write failed: ${e.message}`); }
 
-  // 4. Update history_index
-  try {
-    await updateHistoryIndex(userId, alertId, hitTime);
-    log(`  history_index updated for ${userId}`);
-  } catch(e) { warn(`  history_index update failed: ${e.message}`); }
+  // 4. (history_index removed — app reads history doc directly on login)
 
   // 5. Send FCM
   try {
@@ -1170,24 +1166,7 @@ async function processTriggeredAlert(alert, hitPrice) {
   } catch(e) { warn(`  FCM failed: ${e.message}`); }
 }
 
-async function updateHistoryIndex(userId, alertId, hitTime) {
-  const HISTORY_LIMIT = 100;
-  try {
-    const doc = await firestoreGet(`alerts/${userId}/meta/history_index`);
-    let entries = [];
-    if (doc?.fields?.entries?.stringValue) {
-      try { entries = JSON.parse(doc.fields.entries.stringValue); } catch {}
-    }
-    entries = entries.filter(e => e.id !== alertId);
-    entries.unshift({ id: alertId, updatedAt: hitTime });
-    entries.sort((a, b) => b.updatedAt - a.updatedAt);
-    if (entries.length > HISTORY_LIMIT) entries = entries.slice(0, HISTORY_LIMIT);
-    await firestorePatch(`alerts/${userId}/meta/history_index`, {
-      entries:   { stringValue: JSON.stringify(entries) },
-      updatedAt: { integerValue: String(hitTime) }
-    });
-  } catch(e) { throw e; }
-}
+
 
 async function sendFCM(userId, alert, hitPrice) {
   const token   = await getAccessToken();
