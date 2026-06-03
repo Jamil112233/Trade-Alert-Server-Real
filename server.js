@@ -1221,10 +1221,12 @@ async function sendFCM(userId, alert, hitPrice) {
         vibration:    String(alert.vibrationEnabled !== false),
         sound:        String(alert.soundEnabled !== false),
       },
-      notification: isAlarm ? undefined : {
-        title: `${alert.pairEmoji || ''} ${alert.pairName} Alert`,
-        body:  `${dirLabel} ${priceStr} — ${hitType}`,
-      },
+      // notification field intentionally omitted for ALL message types.
+      // Sending a notification field causes Android to show a system-generated
+      // notification (white box icon, no large icon, wrong channel) BEFORE
+      // onMessageReceived runs. Data-only FCM = app handles everything correctly.
+      // isAlarm=true  → AlarmRingingActivity full-screen alarm
+      // isAlarm=false → AlarmQueue.showNotificationOnly with correct style + large icon
       android: { priority: 'high', direct_boot_ok: true }
     }
   };
