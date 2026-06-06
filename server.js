@@ -406,12 +406,12 @@ function startRtdbListener() {
       scheduleReconnect(delay);
     });
 
-    req.setTimeout(30000, () => {
-      warn('RTDB SSE: request timeout — aborting');
+    req.setTimeout(150000, () => {
+      warn('RTDB SSE: request timeout (150s) — aborting');
       req.destroy();
       connecting = false;
       failCount++;
-      scheduleReconnect(10000);
+      scheduleReconnect(5000);
     });
 
     req.end();
@@ -419,6 +419,9 @@ function startRtdbListener() {
 
   connect();
 }
+
+// Track whether we've done the first full load — reconnects skip the clear
+let rtdbHasLoaded = false;
 
 function handleRtdbEvent(event, data) {
   if (event === 'cancel' || event === 'auth_revoked') {
@@ -433,23 +436,51 @@ function handleRtdbEvent(event, data) {
     const value  = parsed.data;
 
     if (path === '/' || path === '') {
-      // Full data dump on initial connect
-      // value = { userId1: { alertId1: {...}, alertId2: {...} }, userId2: {...} }
-      Object.keys(activeAlerts).forEach(k => delete activeAlerts[k]);
-      if (value && typeof value === 'object') {
-        for (const userId of Object.keys(value)) {
-          const userAlerts = value[userId];
-          if (userAlerts && typeof userAlerts === 'object') {
-            for (const [alertId, alert] of Object.entries(userAlerts)) {
-              if (alert && typeof alert === 'object') {
-                activeAlerts[alertId] = { ...alert, userId };
+      // Firebase sends a full data dump on every (re)connect.
+      // On first connect: clear and reload everything.
+      // On reconnect: merge instead of clearing — we already have the data
+      // and clearing+reloading wastes bandwidth and resets the alert cache.
+      if (!rtdbHasLoaded) {
+        // First load — clear and populate
+        Object.keys(activeAlerts).forEach(k => delete activeAlerts[k]);
+        if (value && typeof value === 'object') {
+          for (const userId of Object.keys(value)) {
+            const userAlerts = value[userId];
+            if (userAlerts && typeof userAlerts === 'object') {
+              for (const [alertId, alert] of Object.entries(userAlerts)) {
+                if (alert && typeof alert === 'object') {
+                  activeAlerts[alertId] = { ...alert, userId };
+                }
               }
             }
           }
         }
+        rtdbHasLoaded = true;
+        log(`RTDB initial load: ${Object.keys(activeAlerts).length} active alerts`);
+        scheduleGateResubscribe();
+      } else {
+        // Reconnect — merge: add any alerts in Firebase not in memory,
+        // remove any in memory that are no longer in Firebase
+        const firestoreIds = new Set();
+        if (value && typeof value === 'object') {
+          for (const userId of Object.keys(value)) {
+            const userAlerts = value[userId];
+            if (userAlerts && typeof userAlerts === 'object') {
+              for (const [alertId, alert] of Object.entries(userAlerts)) {
+                firestoreIds.add(alertId);
+                if (!activeAlerts[alertId] && alert && typeof alert === 'object') {
+                  activeAlerts[alertId] = { ...alert, userId };
+                }
+              }
+            }
+          }
+        }
+        // Remove any alerts no longer in RTDB
+        for (const id of Object.keys(activeAlerts)) {
+          if (!firestoreIds.has(id)) delete activeAlerts[id];
+        }
+        log(`RTDB reconnect sync: ${Object.keys(activeAlerts).length} active alerts (no full reload)`);
       }
-      log(`RTDB initial load: ${Object.keys(activeAlerts).length} active alerts`);
-      scheduleGateResubscribe();
       return;
     }
 
