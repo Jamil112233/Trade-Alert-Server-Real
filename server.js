@@ -304,7 +304,31 @@ function startRtdbListener() {
   const url = `${FIREBASE_URL}/alerts.json?auth=${FIREBASE_SECRET}&stream=true`;
   const u   = new URL(url);
 
+  // ── Connection guard ──────────────────────────────────────────────────────
+  // Only ONE connection attempt may be in-flight at a time.
+  // Without this, rapid ECONNRESET storms spawn dozens of parallel connections,
+  // exhaust Firebase RTDB's 100-connection free-tier limit, and cause an
+  // infinite 402 reconnect loop that burns all bandwidth.
+  let connecting   = false;  // true while an attempt is in-flight
+  let reconnTimer  = null;   // handle to the pending setTimeout
+  let failCount    = 0;      // consecutive failures for exponential backoff
+
+  function scheduleReconnect(delayMs) {
+    if (connecting) return;   // already connecting — don't pile on
+    if (reconnTimer) return;  // already scheduled
+    reconnTimer = setTimeout(() => {
+      reconnTimer = null;
+      connect();
+    }, delayMs);
+  }
+
   function connect() {
+    if (connecting) {
+      warn('RTDB SSE: connect() called while already connecting — skipped');
+      return;
+    }
+    connecting = true;
+
     const req = https.request({
       hostname: u.hostname,
       port:     443,
@@ -313,12 +337,38 @@ function startRtdbListener() {
       headers:  { 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache' }
     }, res => {
       log(`RTDB SSE connected: ${res.statusCode}`);
+
+      // 402 = RTDB connection limit hit (free plan: 100 max).
+      // Destroy immediately and wait a long time before retrying.
+      if (res.statusCode === 402) {
+        warn('RTDB SSE: 402 connection limit — waiting 60s before retry');
+        res.destroy();
+        connecting = false;
+        failCount++;
+        scheduleReconnect(60000); // 1 minute cooldown — let other connections die
+        return;
+      }
+
+      // Non-200 status — short backoff
+      if (res.statusCode !== 200) {
+        warn(`RTDB SSE: unexpected status ${res.statusCode} — retrying in 10s`);
+        res.destroy();
+        connecting = false;
+        failCount++;
+        scheduleReconnect(10000);
+        return;
+      }
+
+      // Successful connection
+      failCount = 0;
+      connecting = false; // connected — not "connecting" anymore, stream is live
+
       let buf = '';
 
       res.on('data', chunk => {
         buf += chunk.toString();
         const lines = buf.split('\n');
-        buf = lines.pop(); // keep incomplete line
+        buf = lines.pop();
 
         let event = null;
         let data  = null;
@@ -329,7 +379,6 @@ function startRtdbListener() {
           } else if (line.startsWith('data:')) {
             data = line.slice(5).trim();
           } else if (line === '' && event && data) {
-            // Complete event
             handleRtdbEvent(event, data);
             event = null;
             data  = null;
@@ -338,19 +387,31 @@ function startRtdbListener() {
       });
 
       res.on('end', () => {
-        warn('RTDB SSE stream ended — reconnecting in 3s');
-        setTimeout(connect, 3000);
+        warn('RTDB SSE stream ended — reconnecting in 5s');
+        scheduleReconnect(5000);
       });
 
       res.on('error', e => {
-        warn(`RTDB SSE error: ${e.message} — reconnecting in 3s`);
-        setTimeout(connect, 3000);
+        warn(`RTDB SSE error: ${e.message} — reconnecting in 5s`);
+        scheduleReconnect(5000);
       });
     });
 
     req.on('error', e => {
-      warn(`RTDB SSE request error: ${e.message} — reconnecting in 5s`);
-      setTimeout(connect, 5000);
+      warn(`RTDB SSE request error: ${e.message} — reconnecting in 10s`);
+      connecting = false;
+      failCount++;
+      // Exponential backoff: 10s, 20s, 40s, max 60s
+      const delay = Math.min(10000 * Math.pow(2, Math.min(failCount - 1, 3)), 60000);
+      scheduleReconnect(delay);
+    });
+
+    req.setTimeout(30000, () => {
+      warn('RTDB SSE: request timeout — aborting');
+      req.destroy();
+      connecting = false;
+      failCount++;
+      scheduleReconnect(10000);
     });
 
     req.end();
