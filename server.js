@@ -121,13 +121,14 @@ function getActiveCandleCloseCryptoPairs(tf) {
 // All times in UTC. Returns true if the market for that symbol is currently open.
 
 const INDEX_HOURS_UTC = {
-  // NYSE/NASDAQ: Mon-Fri 13:30–20:00 UTC
+  // NYSE/NASDAQ cash: Mon-Fri 13:30-20:00 UTC
   SPX500: { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
   US30:   { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
-  US100:  { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
-  // DXY: Mon-Fri 00:00–21:00 UTC (ICE)
+  // NQ Futures (US100): Sun 23:00 - Fri 22:00 UTC (23hr), overnight=true
+  US100:  { days: [0,1,2,3,4,5], open: 23*60, close: 22*60, overnight: true },
+  // DXY: Mon-Fri 00:00-21:00 UTC (ICE)
   DXY:    { days: [1,2,3,4,5], open: 0,         close: 21*60 },
-  // NSE India: Mon-Fri 03:45–10:00 UTC
+  // NSE India: Mon-Fri 03:45-10:00 UTC
   NIF50:  { days: [1,2,3,4,5], open: 3*60+45,  close: 10*60 },
 };
 
@@ -149,13 +150,22 @@ function isForexOpen() {
 }
 
 function isIndexOpen(sym) {
-  if (isWeekend()) return false;
   const h = INDEX_HOURS_UTC[sym];
   if (!h) return false;
   const now  = new Date();
   const day  = now.getUTCDay();
   const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
-  return h.days.includes(day) && mins >= h.open && mins < h.close;
+
+  if (!h.days.includes(day)) return false;
+
+  if (h.overnight) {
+    // Overnight session spans midnight: open > close
+    // Closed on Saturday entirely, and during daily break (22:00-23:00 UTC)
+    if (day === 6) return false; // Saturday always closed
+    return mins >= h.open || mins < h.close;
+  }
+
+  return mins >= h.open && mins < h.close;
 }
 
 function isYahooSymbolOpen(sym) {
@@ -869,7 +879,7 @@ async function pollGateio() {
 // ════════════════════════════════════════════════════════════════════════════
 
 const YAHOO_SYMBOLS = {
-  SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5EIXIC',
+  SPX500: '%5EGSPC', US30: '%5EDJI', US100: 'NQ%3DF',
   DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
   EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
   GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X'
