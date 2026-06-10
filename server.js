@@ -1136,23 +1136,7 @@ async function onMinuteClose() {
     }
   }
 
-  // Metals — fetch last closed candle from Capital.com REST for each relevant TF
-  // This is more reliable than WebSocket state which may have the new open candle already
-  const metalSyms = ['XAU', 'XAG'];
-  const metalFetches = [];
-  for (const sym of metalSyms) {
-    const hasAlerts = Object.values(activeAlerts).some(
-      a => (a.pairSymbol === sym) && a.candleClose && closedTfs.includes(a.timeframe)
-    );
-    if (!hasAlerts) continue;
-    for (const tf of closedTfs) {
-      metalFetches.push(fetchMetalCandleClose(sym, tf));
-    }
-  }
-  if (metalFetches.length > 0) {
-    await Promise.all(metalFetches);
-  }
-
+  // Metals — use WebSocket OHLC snapshot taken just before boundary
   checkCandleCloseAlerts(closedTfs);
 }
 
@@ -1196,9 +1180,9 @@ function checkCandleCloseAlerts(closedTfs) {
 
 function getCandleClose(sym, tf) {
   if (sym === 'XAU' || sym === 'XAG') {
-    // Return the fetched REST close stored in metalPrevOhlc by fetchMetalCandleClose()
     const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    return metalPrevOhlc[sym]?.[resMap[tf]]?.c || 0;
+    // metalPrevOhlc is snapshotted 2s before boundary — correct closed candle
+    return metalPrevOhlc[sym]?.[resMap[tf]]?.c || metalOhlc[sym]?.[resMap[tf]]?.c || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
 }
@@ -1263,12 +1247,45 @@ async function getCapHeaders() {
 }
 
 function startMinuteBoundaryChecker() {
+  let lastSnapshotMin = -1;
+  let lastCloseMin    = -1;
+
   setInterval(() => {
-    const secMs = Date.now() % 60000;
-    if (secMs < 3000) {
+    const now    = Date.now();
+    const secMs  = now % 60000;
+    const minNow = Math.floor(now / 60000);
+    const nowMin = new Date(now).getUTCMinutes();
+
+    // Snapshot at 58-59s — capture WebSocket OHLC BEFORE Capital.com pushes new open candle
+    // Only snapshot for timeframes that are about to close at the NEXT boundary
+    if (secMs >= 58000 && lastSnapshotMin !== minNow) {
+      lastSnapshotMin = minNow;
+      // Which TFs close at the upcoming minute boundary?
+      const nextMin = nowMin + 1;
+      const tfsClosing = ['M1']; // M1 always closes every minute
+      if (nextMin % 5  === 0) tfsClosing.push('M5');
+      if (nextMin % 15 === 0) tfsClosing.push('M15');
+      if (nextMin % 60 === 0) tfsClosing.push('H1');
+
+      const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
+      for (const sym of ['XAU', 'XAG']) {
+        for (const tf of tfsClosing) {
+          const res = resMap[tf];
+          const cur = metalOhlc[sym]?.[res];
+          if (cur && cur.c) {
+            metalPrevOhlc[sym][res] = { ...cur };
+            // log(`  Snapshot ${sym} ${tf} close=${cur.c} at ${secMs}ms`);
+          }
+        }
+      }
+    }
+
+    // Fire onMinuteClose at 0-3s mark
+    if (secMs < 3000 && lastCloseMin !== minNow) {
+      lastCloseMin = minNow;
       onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
     }
-  }, 1000);
+  }, 500);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
