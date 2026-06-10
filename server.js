@@ -1136,7 +1136,23 @@ async function onMinuteClose() {
     }
   }
 
-  // Metals — Capital.com WebSocket stores OHLC in metalOhlc automatically
+  // Metals — fetch last closed candle from Capital.com REST for each relevant TF
+  // This is more reliable than WebSocket state which may have the new open candle already
+  const metalSyms = ['XAU', 'XAG'];
+  const metalFetches = [];
+  for (const sym of metalSyms) {
+    const hasAlerts = Object.values(activeAlerts).some(
+      a => (a.pairSymbol === sym) && a.candleClose && closedTfs.includes(a.timeframe)
+    );
+    if (!hasAlerts) continue;
+    for (const tf of closedTfs) {
+      metalFetches.push(fetchMetalCandleClose(sym, tf));
+    }
+  }
+  if (metalFetches.length > 0) {
+    await Promise.all(metalFetches);
+  }
+
   checkCandleCloseAlerts(closedTfs);
 }
 
@@ -1180,50 +1196,66 @@ function checkCandleCloseAlerts(closedTfs) {
 
 function getCandleClose(sym, tf) {
   if (sym === 'XAU' || sym === 'XAG') {
+    // Return the fetched REST close stored in metalPrevOhlc by fetchMetalCandleClose()
     const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    const res = resMap[tf];
-    // Use previous closed candle if available — avoids reading the currently-open candle
-    // which would give the wrong (new) candle's data at the minute boundary
-    const prev = metalPrevOhlc[sym]?.[res]?.c;
-    if (prev && prev > 0) {
-      return prev;
-    }
-    // Fallback to current if no previous saved yet (first candle after server start)
-    return metalOhlc[sym]?.[res]?.c || 0;
+    return metalPrevOhlc[sym]?.[resMap[tf]]?.c || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
 }
 
-function startMinuteBoundaryChecker() {
-  let lastSnapshotMin = -1;
-  let lastCloseMin    = -1;
+/**
+ * Fetches the last CLOSED candle for XAU/XAG from Capital.com REST API.
+ * Called at the start of onMinuteClose() for relevant timeframes.
+ * Uses limit=2 and takes index [0] (second-to-last = confirmed closed candle).
+ */
+async function fetchMetalCandleClose(sym, tf) {
+  try {
+    const epic   = sym === 'XAU' ? 'GOLD' : 'SILVER';
+    const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
+    const res    = resMap[tf];
+    if (!res) return;
 
-  setInterval(() => {
-    const now   = Date.now();
-    const secMs = now % 60000;         // ms into current minute
-    const minId = Math.floor(now / 60000); // which minute we're in
+    const headers = await getCapHeaders();
+    if (!headers) return;
 
-    // Snapshot metalOhlc at 58s mark (2s before candle closes)
-    // This captures the candle BEFORE Capital.com sends the new open candle
-    if (secMs >= 58000 && lastSnapshotMin !== minId) {
-      lastSnapshotMin = minId;
-      // Deep copy current metalOhlc into metalPrevOhlc as the "about to close" candle
-      for (const sym of ['XAU', 'XAG']) {
-        for (const res of ['MINUTE', 'MINUTE_5', 'MINUTE_15', 'HOUR']) {
-          const cur = metalOhlc[sym]?.[res];
-          if (cur && cur.c) {
-            metalPrevOhlc[sym][res] = { ...cur };
-          }
-        }
-      }
+    const url = `${CAP_REST_URL}/api/v1/prices/${epic}?resolution=${res}&max=3&from=&to=`;
+    const data = await fetchJson(url, { headers });
+
+    // prices array: last entry is the current open candle, second-to-last is last closed candle
+    const prices = data?.prices;
+    if (!prices || prices.length < 2) return;
+
+    const closed = prices[prices.length - 2]; // confirmed closed candle
+    const closePrice = closed?.closePrice?.bid || closed?.closePrice?.ask || 0;
+
+    if (closePrice > 0) {
+      metalPrevOhlc[sym][res] = { c: closePrice, t: closed.snapshotTimeUTC };
+      log(`  REST candle close ${sym} ${tf}: ${closePrice}`);
     }
+  } catch(e) {
+    warn(`fetchMetalCandleClose ${sym} ${tf} error: ${e.message}`);
+  }
+}
 
-    // Fire onMinuteClose at 0-3s mark
-    if (secMs < 3000 && lastCloseMin !== minId) {
-      lastCloseMin = minId;
+async function getCapHeaders() {
+  try {
+    if (!capCst || !capToken) return null;
+    return {
+      'X-CAP-API-KEY':    CAP_API_KEY,
+      'CST':              capCst,
+      'X-SECURITY-TOKEN': capToken,
+      'Content-Type':     'application/json'
+    };
+  } catch { return null; }
+}
+
+function startMinuteBoundaryChecker() {
+  setInterval(() => {
+    const secMs = Date.now() % 60000;
+    if (secMs < 3000) {
       onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
     }
-  }, 500);
+  }, 1000);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
