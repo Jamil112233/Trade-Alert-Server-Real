@@ -121,14 +121,13 @@ function getActiveCandleCloseCryptoPairs(tf) {
 // All times in UTC. Returns true if the market for that symbol is currently open.
 
 const INDEX_HOURS_UTC = {
-  // NYSE/NASDAQ cash: Mon-Fri 13:30-20:00 UTC
+  // NYSE/NASDAQ: Mon-Fri 13:30–20:00 UTC
   SPX500: { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
   US30:   { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
-  // NQ Futures (US100): Sun 23:00 - Fri 22:00 UTC (23hr), overnight=true
-  US100:  { days: [0,1,2,3,4,5], open: 23*60, close: 22*60, overnight: true },
-  // DXY: Mon-Fri 00:00-21:00 UTC (ICE)
+  US100:  { days: [1,2,3,4,5], open: 13*60+30, close: 20*60 },
+  // DXY: Mon-Fri 00:00–21:00 UTC (ICE)
   DXY:    { days: [1,2,3,4,5], open: 0,         close: 21*60 },
-  // NSE India: Mon-Fri 03:45-10:00 UTC
+  // NSE India: Mon-Fri 03:45–10:00 UTC
   NIF50:  { days: [1,2,3,4,5], open: 3*60+45,  close: 10*60 },
 };
 
@@ -150,22 +149,13 @@ function isForexOpen() {
 }
 
 function isIndexOpen(sym) {
+  if (isWeekend()) return false;
   const h = INDEX_HOURS_UTC[sym];
   if (!h) return false;
   const now  = new Date();
   const day  = now.getUTCDay();
   const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
-
-  if (!h.days.includes(day)) return false;
-
-  if (h.overnight) {
-    // Overnight session spans midnight: open > close
-    // Closed on Saturday entirely, and during daily break (22:00-23:00 UTC)
-    if (day === 6) return false; // Saturday always closed
-    return mins >= h.open || mins < h.close;
-  }
-
-  return mins >= h.open && mins < h.close;
+  return h.days.includes(day) && mins >= h.open && mins < h.close;
 }
 
 function isYahooSymbolOpen(sym) {
@@ -549,6 +539,13 @@ const metalOhlc = {
   XAG: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
 };
 
+// Stores the PREVIOUS closed candle for each resolution
+// Updated when a new candle starts (timestamp changes) — this is what candle-close alerts check
+const metalPrevOhlc = {
+  XAU: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
+  XAG: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
+};
+
 async function createCapSession() {
   log('Creating Capital.com session...');
   const res = await fetchJson(`${CAP_REST_URL}/api/v1/session`, {
@@ -675,7 +672,13 @@ function connectCapWs() {
         const h   = msg.payload.h;
         const l   = msg.payload.l;
         if (c && h && l) {
-          metalOhlc[sym][res] = { h, l, c, t: msg.payload.t };
+          const newT = msg.payload.t;
+          const curT = metalOhlc[sym][res]?.t;
+          // When timestamp changes, a new candle has started — save the old one as "previous closed"
+          if (curT && newT && newT !== curT) {
+            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res] };
+          }
+          metalOhlc[sym][res] = { h, l, c, t: newT };
           if (res === 'MINUTE') {
             const existingByTf = m1Candle[sym]?.byTf;
             m1Candle[sym] = { high: h, low: l, close: c, byTf: existingByTf || {} };
@@ -879,7 +882,7 @@ async function pollGateio() {
 // ════════════════════════════════════════════════════════════════════════════
 
 const YAHOO_SYMBOLS = {
-  SPX500: '%5EGSPC', US30: '%5EDJI', US100: 'NQ%3DF',
+  SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5EIXIC',
   DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
   EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
   GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X'
@@ -1183,7 +1186,15 @@ function checkCandleCloseAlerts(closedTfs) {
 function getCandleClose(sym, tf) {
   if (sym === 'XAU' || sym === 'XAG') {
     const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    return metalOhlc[sym]?.[resMap[tf]]?.c || 0;
+    const res = resMap[tf];
+    // Use previous closed candle if available — avoids reading the currently-open candle
+    // which would give the wrong (new) candle's data at the minute boundary
+    const prev = metalPrevOhlc[sym]?.[res]?.c;
+    if (prev && prev > 0) {
+      return prev;
+    }
+    // Fallback to current if no previous saved yet (first candle after server start)
+    return metalOhlc[sym]?.[res]?.c || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
 }
