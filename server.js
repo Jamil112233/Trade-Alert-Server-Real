@@ -673,6 +673,13 @@ function connectCapWs() {
         const l   = msg.payload.l;
         if (c && h && l) {
           const newT = msg.payload.t;
+          const curT = metalOhlc[sym]?.[res]?.t;
+          // When Capital.com starts a new candle (timestamp changes),
+          // save the PREVIOUS candle's final close into metalPrevOhlc.
+          // This is the most accurate closed candle value.
+          if (curT && newT && newT !== curT && metalOhlc[sym][res]?.c) {
+            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res] };
+          }
           metalOhlc[sym][res] = { h, l, c, t: newT };
           if (res === 'MINUTE') {
             const existingByTf = m1Candle[sym]?.byTf;
@@ -1181,8 +1188,16 @@ function checkCandleCloseAlerts(closedTfs) {
 function getCandleClose(sym, tf) {
   if (sym === 'XAU' || sym === 'XAG') {
     const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    // metalPrevOhlc is snapshotted 2s before boundary — correct closed candle
-    return metalPrevOhlc[sym]?.[resMap[tf]]?.c || metalOhlc[sym]?.[resMap[tf]]?.c || 0;
+    const res    = resMap[tf];
+    const prev   = metalPrevOhlc[sym]?.[res];
+    const cur    = metalOhlc[sym]?.[res];
+    // Use prev only if it has a DIFFERENT timestamp than cur
+    // meaning Capital.com already confirmed the candle closed (new candle started)
+    if (prev?.c && cur?.t && prev?.t && prev.t !== cur.t) {
+      return prev.c;
+    }
+    // Otherwise use current — it's still the forming candle at boundary
+    return cur?.c || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
 }
@@ -1247,40 +1262,11 @@ async function getCapHeaders() {
 }
 
 function startMinuteBoundaryChecker() {
-  let lastSnapshotMin = -1;
-  let lastCloseMin    = -1;
-
+  let lastCloseMin = -1;
   setInterval(() => {
     const now    = Date.now();
     const secMs  = now % 60000;
     const minNow = Math.floor(now / 60000);
-    const nowMin = new Date(now).getUTCMinutes();
-
-    // Snapshot at 58-59s — capture WebSocket OHLC BEFORE Capital.com pushes new open candle
-    // Only snapshot for timeframes that are about to close at the NEXT boundary
-    if (secMs >= 58000 && lastSnapshotMin !== minNow) {
-      lastSnapshotMin = minNow;
-      // Which TFs close at the upcoming minute boundary?
-      const nextMin = nowMin + 1;
-      const tfsClosing = ['M1']; // M1 always closes every minute
-      if (nextMin % 5  === 0) tfsClosing.push('M5');
-      if (nextMin % 15 === 0) tfsClosing.push('M15');
-      if (nextMin % 60 === 0) tfsClosing.push('H1');
-
-      const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-      for (const sym of ['XAU', 'XAG']) {
-        for (const tf of tfsClosing) {
-          const res = resMap[tf];
-          const cur = metalOhlc[sym]?.[res];
-          if (cur && cur.c) {
-            metalPrevOhlc[sym][res] = { ...cur };
-            // log(`  Snapshot ${sym} ${tf} close=${cur.c} at ${secMs}ms`);
-          }
-        }
-      }
-    }
-
-    // Fire onMinuteClose at 0-3s mark
     if (secMs < 3000 && lastCloseMin !== minNow) {
       lastCloseMin = minNow;
       onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
