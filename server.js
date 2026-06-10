@@ -673,11 +673,6 @@ function connectCapWs() {
         const l   = msg.payload.l;
         if (c && h && l) {
           const newT = msg.payload.t;
-          const curT = metalOhlc[sym][res]?.t;
-          // When timestamp changes, a new candle has started — save the old one as "previous closed"
-          if (curT && newT && newT !== curT) {
-            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res] };
-          }
           metalOhlc[sym][res] = { h, l, c, t: newT };
           if (res === 'MINUTE') {
             const existingByTf = m1Candle[sym]?.byTf;
@@ -1200,12 +1195,35 @@ function getCandleClose(sym, tf) {
 }
 
 function startMinuteBoundaryChecker() {
+  let lastSnapshotMin = -1;
+  let lastCloseMin    = -1;
+
   setInterval(() => {
-    const secMs = Date.now() % 60000;
-    if (secMs < 3000) {
+    const now   = Date.now();
+    const secMs = now % 60000;         // ms into current minute
+    const minId = Math.floor(now / 60000); // which minute we're in
+
+    // Snapshot metalOhlc at 58s mark (2s before candle closes)
+    // This captures the candle BEFORE Capital.com sends the new open candle
+    if (secMs >= 58000 && lastSnapshotMin !== minId) {
+      lastSnapshotMin = minId;
+      // Deep copy current metalOhlc into metalPrevOhlc as the "about to close" candle
+      for (const sym of ['XAU', 'XAG']) {
+        for (const res of ['MINUTE', 'MINUTE_5', 'MINUTE_15', 'HOUR']) {
+          const cur = metalOhlc[sym]?.[res];
+          if (cur && cur.c) {
+            metalPrevOhlc[sym][res] = { ...cur };
+          }
+        }
+      }
+    }
+
+    // Fire onMinuteClose at 0-3s mark
+    if (secMs < 3000 && lastCloseMin !== minId) {
+      lastCloseMin = minId;
       onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
     }
-  }, 1000);
+  }, 500);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
