@@ -1216,24 +1216,37 @@ async function fetchMetalCandleClose(sym, tf) {
     if (!res) return;
 
     const headers = await getCapHeaders();
-    if (!headers) return;
+    if (!headers) {
+      warn(`  fetchMetalCandleClose ${sym} ${tf}: no cap headers (capCst=${!!capCst} capToken=${!!capToken})`);
+      return;
+    }
 
-    const url = `${CAP_REST_URL}/api/v1/prices/${epic}?resolution=${res}&max=3&from=&to=`;
+    const url = `${CAP_REST_URL}/api/v1/prices/${epic}?resolution=${res}&max=3`;
+    log(`  fetchMetalCandleClose fetching: ${url}`);
     const data = await fetchJson(url, { headers });
+    log(`  fetchMetalCandleClose raw response: ${JSON.stringify(data).slice(0, 300)}`);
 
-    // prices array: last entry is the current open candle, second-to-last is last closed candle
     const prices = data?.prices;
-    if (!prices || prices.length < 2) return;
+    if (!prices || prices.length < 2) {
+      warn(`  fetchMetalCandleClose ${sym} ${tf}: not enough prices (got ${prices?.length})`);
+      return;
+    }
 
-    const closed = prices[prices.length - 2]; // confirmed closed candle
-    const closePrice = closed?.closePrice?.bid || closed?.closePrice?.ask || 0;
+    const closed = prices[prices.length - 2];
+    log(`  fetchMetalCandleClose closed candle: ${JSON.stringify(closed)}`);
+    const closePrice = closed?.closePrice?.bid
+      || closed?.closePrice?.ask
+      || closed?.closePrice?.mid
+      || 0;
 
     if (closePrice > 0) {
       metalPrevOhlc[sym][res] = { c: closePrice, t: closed.snapshotTimeUTC };
       log(`  REST candle close ${sym} ${tf}: ${closePrice}`);
+    } else {
+      warn(`  fetchMetalCandleClose ${sym} ${tf}: closePrice=0 from candle=${JSON.stringify(closed?.closePrice)}`);
     }
   } catch(e) {
-    warn(`fetchMetalCandleClose ${sym} ${tf} error: ${e.message}`);
+    warn(`fetchMetalCandleClose ${sym} ${tf} error: ${e.message} stack=${e.stack?.slice(0,200)}`);
   }
 }
 
