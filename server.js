@@ -1232,7 +1232,7 @@ async function fetchMetalCandleClose(sym, tf) {
       return;
     }
 
-    const closed = prices[prices.length - 2];
+    const closed = prices[prices.length - 1]; // last entry is the most recently closed candle
     log(`  fetchMetalCandleClose closed candle: ${JSON.stringify(closed)}`);
     const closePrice = closed?.closePrice?.bid
       || closed?.closePrice?.ask
