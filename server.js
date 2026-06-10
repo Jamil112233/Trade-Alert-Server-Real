@@ -678,7 +678,7 @@ function connectCapWs() {
           // save the PREVIOUS candle's final close into metalPrevOhlc.
           // This is the most accurate closed candle value.
           if (curT && newT && newT !== curT && metalOhlc[sym][res]?.c) {
-            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res] };
+            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res], used: false };
           }
           metalOhlc[sym][res] = { h, l, c, t: newT };
           if (res === 'MINUTE') {
@@ -1191,12 +1191,15 @@ function getCandleClose(sym, tf) {
     const res    = resMap[tf];
     const prev   = metalPrevOhlc[sym]?.[res];
     const cur    = metalOhlc[sym]?.[res];
-    // Use prev only if it has a DIFFERENT timestamp than cur
-    // meaning Capital.com already confirmed the candle closed (new candle started)
-    if (prev?.c && cur?.t && prev?.t && prev.t !== cur.t) {
+
+    // Use prev only if it has a DIFFERENT timestamp than cur AND hasn't been used yet
+    // Mark as used by clearing the timestamp after reading so next minute uses cur instead
+    if (prev?.c && cur?.t && prev?.t && prev.t !== cur.t && !prev.used) {
+      metalPrevOhlc[sym][res].used = true; // mark so we don't read stale prev next minute
       return prev.c;
     }
-    // Otherwise use current — it's still the forming candle at boundary
+    // cur is the candle that just closed (Capital.com hasn't sent new open yet)
+    // OR prev was already used last minute
     return cur?.c || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
