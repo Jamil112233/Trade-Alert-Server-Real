@@ -678,7 +678,7 @@ function connectCapWs() {
           // save the PREVIOUS candle's final close into metalPrevOhlc.
           // This is the most accurate closed candle value.
           if (curT && newT && newT !== curT && metalOhlc[sym][res]?.c) {
-            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res], used: false };
+            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res] };
           }
           metalOhlc[sym][res] = { h, l, c, t: newT };
           if (res === 'MINUTE') {
@@ -1143,7 +1143,23 @@ async function onMinuteClose() {
     }
   }
 
-  // Metals — use WebSocket OHLC snapshot taken just before boundary
+  // Metals — fetch confirmed closed candle from Capital.com REST before checking alerts.
+  // This avoids the race condition where metalPrevOhlc may not have been updated yet
+  // by the WebSocket (Capital.com sometimes sends the new candle open after our 2s delay).
+  const metalSymsWithAlerts = ['XAU', 'XAG'].filter(sym =>
+    closedTfs.some(tf =>
+      Object.values(activeAlerts).some(a => a.candleClose && a.timeframe === tf && a.pairSymbol === sym)
+    )
+  );
+  if (metalSymsWithAlerts.length > 0) {
+    await Promise.all(
+      metalSymsWithAlerts.flatMap(sym =>
+        closedTfs.filter(tf =>
+          Object.values(activeAlerts).some(a => a.candleClose && a.timeframe === tf && a.pairSymbol === sym)
+        ).map(tf => fetchMetalCandleClose(sym, tf))
+      )
+    );
+  }
   checkCandleCloseAlerts(closedTfs);
 }
 
@@ -1192,14 +1208,10 @@ function getCandleClose(sym, tf) {
     const prev   = metalPrevOhlc[sym]?.[res];
     const cur    = metalOhlc[sym]?.[res];
 
-    // Use prev only if it has a DIFFERENT timestamp than cur AND hasn't been used yet
-    // Mark as used by clearing the timestamp after reading so next minute uses cur instead
-    if (prev?.c && cur?.t && prev?.t && prev.t !== cur.t && !prev.used) {
-      metalPrevOhlc[sym][res].used = true; // mark so we don't read stale prev next minute
-      return prev.c;
-    }
-    // cur is the candle that just closed (Capital.com hasn't sent new open yet)
-    // OR prev was already used last minute
+    // fetchMetalCandleClose() is always called before this function,
+    // so metalPrevOhlc holds the confirmed closed candle from Capital.com REST.
+    // Use prev if available; fall back to cur (e.g. if REST fetch failed).
+    if (prev?.c) return prev.c;
     return cur?.c || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
