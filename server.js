@@ -1272,7 +1272,11 @@ function startMinuteBoundaryChecker() {
     const minNow = Math.floor(now / 60000);
     if (secMs < 3000 && lastCloseMin !== minNow) {
       lastCloseMin = minNow;
-      onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
+      // Delay 2 seconds — gives Capital.com WebSocket time to send the new candle open event,
+      // which triggers metalPrevOhlc to be saved with the correct just-closed candle price
+      setTimeout(() => {
+        onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
+      }, 2000);
     }
   }, 500);
 }
