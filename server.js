@@ -534,17 +534,10 @@ let capCst = null;
 let capToken = null;
 let capWs = null;
 
-const metalOhlc = {
-  XAU: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
-  XAG: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
-};
-
-// Stores the PREVIOUS closed candle for each resolution
-// Updated when a new candle starts (timestamp changes) — this is what candle-close alerts check
-const metalPrevOhlc = {
-  XAU: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
-  XAG: { MINUTE:{}, MINUTE_5:{}, MINUTE_15:{}, HOUR:{} },
-};
+// Snapshot of livePrice taken at the exact minute boundary (first 500ms of new minute).
+// Used as the candle close price for XAU/XAG candle-close alerts — matches the chart close exactly.
+// Key = tf ("M1","M5","M15","H1"), value = price at that boundary
+const metalCloseSnapshot = { XAU: {}, XAG: {} };
 
 async function createCapSession() {
   log('Creating Capital.com session...');
@@ -665,26 +658,15 @@ function connectCapWs() {
         }
       }
 
-      // OHLC candle close
+      // OHLC candle updates — kept for m1Candle high/low tracking (miss-hit detection)
       if (msg.destination === 'ohlc.event' && sym) {
         const res = msg.payload.resolution;
         const c   = msg.payload.c;
         const h   = msg.payload.h;
         const l   = msg.payload.l;
-        if (c && h && l) {
-          const newT = msg.payload.t;
-          const curT = metalOhlc[sym]?.[res]?.t;
-          // When Capital.com starts a new candle (timestamp changes),
-          // save the PREVIOUS candle's final close into metalPrevOhlc.
-          // This is the most accurate closed candle value.
-          if (curT && newT && newT !== curT && metalOhlc[sym][res]?.c) {
-            metalPrevOhlc[sym][res] = { ...metalOhlc[sym][res] };
-          }
-          metalOhlc[sym][res] = { h, l, c, t: newT };
-          if (res === 'MINUTE') {
-            const existingByTf = m1Candle[sym]?.byTf;
-            m1Candle[sym] = { high: h, low: l, close: c, byTf: existingByTf || {} };
-          }
+        if (c && h && l && res === 'MINUTE') {
+          const existingByTf = m1Candle[sym]?.byTf;
+          m1Candle[sym] = { high: h, low: l, close: c, byTf: existingByTf || {} };
         }
       }
 
@@ -1143,23 +1125,8 @@ async function onMinuteClose() {
     }
   }
 
-  // Metals — fetch confirmed closed candle from Capital.com REST before checking alerts.
-  // This avoids the race condition where metalPrevOhlc may not have been updated yet
-  // by the WebSocket (Capital.com sometimes sends the new candle open after our 2s delay).
-  const metalSymsWithAlerts = ['XAU', 'XAG'].filter(sym =>
-    closedTfs.some(tf =>
-      Object.values(activeAlerts).some(a => a.candleClose && a.timeframe === tf && a.pairSymbol === sym)
-    )
-  );
-  if (metalSymsWithAlerts.length > 0) {
-    await Promise.all(
-      metalSymsWithAlerts.flatMap(sym =>
-        closedTfs.filter(tf =>
-          Object.values(activeAlerts).some(a => a.candleClose && a.timeframe === tf && a.pairSymbol === sym)
-        ).map(tf => fetchMetalCandleClose(sym, tf))
-      )
-    );
-  }
+  // Metals — metalCloseSnapshot was already taken at boundary in startMinuteBoundaryChecker.
+  // No REST call needed; just check alerts directly.
   checkCandleCloseAlerts(closedTfs);
 }
 
@@ -1203,78 +1170,13 @@ function checkCandleCloseAlerts(closedTfs) {
 
 function getCandleClose(sym, tf) {
   if (sym === 'XAU' || sym === 'XAG') {
-    const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    const res    = resMap[tf];
-    const prev   = metalPrevOhlc[sym]?.[res];
-    const cur    = metalOhlc[sym]?.[res];
-
-    // fetchMetalCandleClose() is always called before this function,
-    // so metalPrevOhlc holds the confirmed closed candle from Capital.com REST.
-    // Use prev if available; fall back to cur (e.g. if REST fetch failed).
-    if (prev?.c) return prev.c;
-    return cur?.c || 0;
+    // Use live price snapshot taken at the exact minute boundary — matches chart candle close.
+    // Falls back to current live price if snapshot missing (e.g. server just started).
+    return metalCloseSnapshot[sym]?.[tf] || livePrice[sym] || 0;
   }
   return m1Candle[sym]?.byTf?.[tf]?.close || 0;
 }
 
-/**
- * Fetches the last CLOSED candle for XAU/XAG from Capital.com REST API.
- * Called at the start of onMinuteClose() for relevant timeframes.
- * Uses limit=2 and takes index [0] (second-to-last = confirmed closed candle).
- */
-async function fetchMetalCandleClose(sym, tf) {
-  try {
-    const epic   = sym === 'XAU' ? 'GOLD' : 'SILVER';
-    const resMap = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
-    const res    = resMap[tf];
-    if (!res) return;
-
-    const headers = await getCapHeaders();
-    if (!headers) {
-      warn(`  fetchMetalCandleClose ${sym} ${tf}: no cap headers (capCst=${!!capCst} capToken=${!!capToken})`);
-      return;
-    }
-
-    const url = `${CAP_REST_URL}/api/v1/prices/${epic}?resolution=${res}&max=3`;
-    log(`  fetchMetalCandleClose fetching: ${url}`);
-    const data = await fetchJson(url, { headers });
-    log(`  fetchMetalCandleClose raw response: ${JSON.stringify(data).slice(0, 300)}`);
-
-    const prices = data?.prices;
-    if (!prices || prices.length < 2) {
-      warn(`  fetchMetalCandleClose ${sym} ${tf}: not enough prices (got ${prices?.length})`);
-      return;
-    }
-
-    const closed = prices[prices.length - 1]; // last entry is the most recently closed candle
-    log(`  fetchMetalCandleClose closed candle: ${JSON.stringify(closed)}`);
-    const bid = closed?.closePrice?.bid || 0;
-    const ask = closed?.closePrice?.ask || 0;
-    const mid = closed?.closePrice?.mid || 0;
-    const closePrice = mid || (bid > 0 && ask > 0 ? (bid + ask) / 2 : (bid || ask));
-
-    if (closePrice > 0) {
-      metalPrevOhlc[sym][res] = { c: closePrice, t: closed.snapshotTimeUTC };
-      log(`  REST candle close ${sym} ${tf}: ${closePrice}`);
-    } else {
-      warn(`  fetchMetalCandleClose ${sym} ${tf}: closePrice=0 from candle=${JSON.stringify(closed?.closePrice)}`);
-    }
-  } catch(e) {
-    warn(`fetchMetalCandleClose ${sym} ${tf} error: ${e.message} stack=${e.stack?.slice(0,200)}`);
-  }
-}
-
-async function getCapHeaders() {
-  try {
-    if (!capCst || !capToken) return null;
-    return {
-      'X-CAP-API-KEY':    CAP_API_KEY,
-      'CST':              capCst,
-      'X-SECURITY-TOKEN': capToken,
-      'Content-Type':     'application/json'
-    };
-  } catch { return null; }
-}
 
 function startMinuteBoundaryChecker() {
   let lastCloseMin = -1;
@@ -1282,13 +1184,25 @@ function startMinuteBoundaryChecker() {
     const now    = Date.now();
     const secMs  = now % 60000;
     const minNow = Math.floor(now / 60000);
-    if (secMs < 3000 && lastCloseMin !== minNow) {
+    // Fire within first 500ms of the new minute — snapshot live prices right at the boundary
+    // so metalCloseSnapshot holds the closest possible value to the actual candle close.
+    // No delay needed since we no longer rely on Capital.com WebSocket candle rotation.
+    if (secMs < 500 && lastCloseMin !== minNow) {
       lastCloseMin = minNow;
-      // Delay 2 seconds — gives Capital.com WebSocket time to send the new candle open event,
-      // which triggers metalPrevOhlc to be saved with the correct just-closed candle price
-      setTimeout(() => {
-        onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
-      }, 2000);
+      // Snapshot XAU/XAG live price at this exact moment for all timeframes closing now
+      const closedM5  = minNow % 5  === 0;
+      const closedM15 = minNow % 15 === 0;
+      const closedH1  = minNow % 60 === 0;
+      for (const sym of ['XAU', 'XAG']) {
+        const price = livePrice[sym];
+        if (price > 0) {
+          metalCloseSnapshot[sym]['M1'] = price;
+          if (closedM5)  metalCloseSnapshot[sym]['M5']  = price;
+          if (closedM15) metalCloseSnapshot[sym]['M15'] = price;
+          if (closedH1)  metalCloseSnapshot[sym]['H1']  = price;
+        }
+      }
+      onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
     }
   }, 500);
 }
