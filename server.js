@@ -133,26 +133,29 @@ const INDEX_HOURS_UTC = {
 
 const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP']);
 
-// ── TEMPORARY TEST FLAG ───────────────────────────────────────────────────────
-// When true, forex pairs are treated as "open" even on weekends, so live prices
-// keep flowing for testing (e.g. alarm trigger screenshot). Set back to false
-// once testing is done — this is NOT meant to run permanently on weekends.
-const FORCE_FOREX_OPEN = true;
-
 function isWeekend() {
   const day = new Date().getUTCDay(); // 0=Sun, 6=Sat
   return day === 0 || day === 6;
 }
 
+// Forex/metals weekly session: closed Sat all day, closed Sun until 20:00 UTC
+// (2hr earlier than the standard 22:00 UTC open — errs early so we never miss
+// the volatile open when brokers shift by 1hr for DST), open Mon-Thu all day,
+// closed Fri from 21:00 UTC onward.
 function isForexOpen() {
-  if (FORCE_FOREX_OPEN) return true;
-  // Forex is open Mon 00:00 UTC through Fri 21:00 UTC (approximately)
-  if (isWeekend()) return false;
-  const now = new Date();
-  const day  = now.getUTCDay();
+  const now  = new Date();
+  const day  = now.getUTCDay(); // 0=Sun ... 6=Sat
   const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (day === 5 && mins >= 21*60) return false; // Friday after 21:00 UTC
-  return true;
+
+  if (day === 6) return false;                 // Saturday — fully closed
+  if (day === 0) return mins >= 20*60;          // Sunday — closed until 20:00 UTC
+  if (day === 5 && mins >= 21*60) return false; // Friday after 21:00 UTC — closed
+  return true;                                  // Mon-Thu, and Fri before 21:00 UTC
+}
+
+// XAU/XAG follow the same weekly trading session as forex (Capital.com).
+function isMetalsOpen() {
+  return isForexOpen();
 }
 
 function isIndexOpen(sym) {
@@ -885,11 +888,16 @@ for (const sym of Object.keys(YAHOO_SYMBOLS)) YAHOO_SYMBOLS_KEYS.add(sym);
 YAHOO_SYMBOLS_KEYS.delete('USDGBP');
 
 async function pollYahoo() {
-  // Fix 6: Skip entirely on weekends — forex and indices are both closed
-  // (unless FORCE_FOREX_OPEN test flag is set, in which case continue so forex can be polled)
-  if (isWeekend() && !FORCE_FOREX_OPEN) {
-    log('Yahoo: skipping — weekend, markets closed');
-    return;
+  // Skip entirely on Saturday, or Sunday before 20:00 UTC — nothing is open yet
+  // (forex/metals open Sun 20:00 UTC at the earliest, indices never open on weekends)
+  {
+    const now  = new Date();
+    const day  = now.getUTCDay();
+    const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+    if (day === 6 || (day === 0 && mins < 20*60)) {
+      log('Yahoo: skipping — weekend, markets closed');
+      return;
+    }
   }
 
   // Fix 2: Only poll pairs that have at least one active alert AND whose market is open
@@ -993,6 +1001,12 @@ function checkAlerts() {
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
       if (alert.candleClose) continue; // handled by checkCandleCloseAlerts at minute boundary
 
+      // Skip when this symbol's market is currently closed — livePrice may hold a
+      // stale pre-close value (WS stays connected on weekends, just not updating).
+      const sym = alert.pairSymbol;
+      if ((sym === 'XAU' || sym === 'XAG') && !isMetalsOpen()) continue;
+      if (FOREX_PAIRS.has(sym) && !isForexOpen()) continue;
+
       const price = livePrice[alert.pairSymbol];
       if (!price || price <= 0) continue;
 
@@ -1072,9 +1086,10 @@ async function onMinuteClose() {
     }
   }
 
-  // Yahoo candle close for indices + forex — only active pairs, market hours only
-  // Fetches the right interval per TF so M5/M15/H1 candle-close alerts work correctly.
-  if (!isWeekend() || FORCE_FOREX_OPEN) {
+  // Yahoo candle close for indices + forex — only active pairs, market hours only.
+  // isYahooSymbolOpen() per-symbol filter below correctly handles weekend/session hours
+  // for both forex (Sun 20:00 UTC open) and indices, so no outer weekend gate needed.
+  {
     const activeYahoo = getActiveYahooPairs();
     const toFetch     = [...activeYahoo].filter(sym => isYahooSymbolOpen(sym));
 
@@ -1154,6 +1169,12 @@ function checkCandleCloseAlerts(closedTfs) {
         log(`    SKIP ${alert.id}: recentlyTriggered`); continue;
       }
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
+
+      // Skip when this symbol's market is currently closed — avoids firing on
+      // a stale weekend price snapshot/candle.
+      const sym = alert.pairSymbol;
+      if ((sym === 'XAU' || sym === 'XAG') && !isMetalsOpen()) continue;
+      if (FOREX_PAIRS.has(sym) && !isForexOpen()) continue;
 
       const close = getCandleClose(alert.pairSymbol, alert.timeframe);
       log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction}`);
@@ -1358,6 +1379,9 @@ function formatPrice(price, sym) {
 
 async function updateRtdbPrices() {
   if (!livePrice.XAU && !livePrice.XAG) return;
+  // Skip on weekends — market closed, price is stale, no need to push to RTDB
+  // (saves bandwidth/usage; mobile app simply keeps showing the last value it has)
+  if (!isMetalsOpen()) return;
   try {
     await rtdbSet('prices', {
       xau: { current: livePrice.XAU || 0, updatedAt: Date.now() },
