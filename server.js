@@ -133,12 +133,19 @@ const INDEX_HOURS_UTC = {
 
 const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP']);
 
+// ── TEMPORARY TEST FLAG ───────────────────────────────────────────────────────
+// When true, forex pairs are treated as "open" even on weekends, so live prices
+// keep flowing for testing (e.g. alarm trigger screenshot). Set back to false
+// once testing is done — this is NOT meant to run permanently on weekends.
+const FORCE_FOREX_OPEN = true;
+
 function isWeekend() {
   const day = new Date().getUTCDay(); // 0=Sun, 6=Sat
   return day === 0 || day === 6;
 }
 
 function isForexOpen() {
+  if (FORCE_FOREX_OPEN) return true;
   // Forex is open Mon 00:00 UTC through Fri 21:00 UTC (approximately)
   if (isWeekend()) return false;
   const now = new Date();
@@ -879,7 +886,8 @@ YAHOO_SYMBOLS_KEYS.delete('USDGBP');
 
 async function pollYahoo() {
   // Fix 6: Skip entirely on weekends — forex and indices are both closed
-  if (isWeekend()) {
+  // (unless FORCE_FOREX_OPEN test flag is set, in which case continue so forex can be polled)
+  if (isWeekend() && !FORCE_FOREX_OPEN) {
     log('Yahoo: skipping — weekend, markets closed');
     return;
   }
@@ -1066,7 +1074,7 @@ async function onMinuteClose() {
 
   // Yahoo candle close for indices + forex — only active pairs, market hours only
   // Fetches the right interval per TF so M5/M15/H1 candle-close alerts work correctly.
-  if (!isWeekend()) {
+  if (!isWeekend() || FORCE_FOREX_OPEN) {
     const activeYahoo = getActiveYahooPairs();
     const toFetch     = [...activeYahoo].filter(sym => isYahooSymbolOpen(sym));
 
