@@ -159,11 +159,6 @@ function isMetalsOpen() {
 }
 
 function isIndexOpen(sym) {
-  // US100 (Nasdaq futures, NQ=F) trades near-continuously like forex/metals —
-  // opens Sunday evening UTC, so use the same session logic as forex instead
-  // of the Mon-Fri-only weekend block below.
-  if (sym === 'US100') return isForexOpen();
-
   if (isWeekend()) return false;
   const h = INDEX_HOURS_UTC[sym];
   if (!h) return false;
@@ -881,7 +876,7 @@ async function pollGateio() {
 // ════════════════════════════════════════════════════════════════════════════
 
 const YAHOO_SYMBOLS = {
-  SPX500: '%5EGSPC', US30: '%5EDJI', US100: 'NQ=F',
+  SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5ENDX',
   DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
   EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
   GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X'
