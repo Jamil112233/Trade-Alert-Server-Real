@@ -661,10 +661,9 @@ function connectCapWs() {
       if (msg.destination === 'quote' && sym) {
         const bid = msg.payload.bid || 0;
         const ask = msg.payload.ofr || 0;
-        const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : (bid || ask);
-        if (mid > 0) {
-          livePrice[sym] = mid;
-          updateOpenCandle(sym, mid);
+        if (bid > 0) {
+          livePrice[sym] = bid;
+          updateOpenCandle(sym, bid);
         }
       }
 
