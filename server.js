@@ -544,6 +544,10 @@ let capCst = null;
 let capToken = null;
 let capWs = null;
 
+// Tracks the last time a live price tick was received from Capital.com WS per symbol.
+// Used by the staleness watchdog to detect silent stalls (connected but no data flowing).
+const lastTickAt = { XAU: 0, XAG: 0 };
+
 // Snapshot of livePrice taken at the exact minute boundary (first 500ms of new minute).
 // Used as the candle close price for XAU/XAG candle-close alerts — matches the chart close exactly.
 // Key = tf ("M1","M5","M15","H1"), value = price at that boundary
@@ -616,6 +620,26 @@ async function pingCapSession() {
   } catch(e) { warn(`pingCapSession: ${e.message}`); }
 }
 
+// Watchdog: checks every 60s whether Capital.com WS is still delivering ticks.
+// If XAU hasn't had a tick for 2 minutes during market hours, the stream has
+// silently stalled — force-reconnect immediately so users aren't stuck on a stale price.
+function startCapWsWatchdog() {
+  setInterval(() => {
+    if (!isMetalsOpen()) return; // market closed — no ticks expected
+    const now     = Date.now();
+    const staleMs = 2 * 60 * 1000; // 2 minutes
+    const xauAge  = now - lastTickAt.XAU;
+    const xagAge  = now - lastTickAt.XAG;
+    if (lastTickAt.XAU > 0 && xauAge > staleMs) {
+      warn(`Capital.com WS stale — XAU last tick ${Math.round(xauAge/1000)}s ago — force reconnecting`);
+      reconnectCapWs();
+    } else if (lastTickAt.XAG > 0 && xagAge > staleMs) {
+      warn(`Capital.com WS stale — XAG last tick ${Math.round(xagAge/1000)}s ago — force reconnecting`);
+      reconnectCapWs();
+    }
+  }, 60 * 1000);
+}
+
 function connectCapWs() {
   log('Connecting Capital.com WebSocket...');
   capWs = new WebSocket(CAP_WS_URL);
@@ -663,6 +687,7 @@ function connectCapWs() {
         const ask = msg.payload.ofr || 0;
         if (bid > 0) {
           livePrice[sym] = bid;
+          lastTickAt[sym] = Date.now();
           updateOpenCandle(sym, bid);
         }
       }
@@ -1434,6 +1459,7 @@ async function main() {
   await createCapSession();
   connectCapWs();
   setInterval(pingCapSession, 9 * 60 * 1000);
+  startCapWsWatchdog(); // detects silent stalls — force reconnects if no tick for 2min
 
   // Gate.io WebSocket for instant crypto prices
   connectGateWs();
