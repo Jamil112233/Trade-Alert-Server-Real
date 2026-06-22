@@ -91,58 +91,35 @@ function sendAlertEmail(issueKey, subject, body) {
     fullBody
   ].join('\r\n');
 
-  const b64msg = Buffer.from(message).toString('base64');
-
-  // SMTP over TLS (port 587 STARTTLS)
-  const net = require('net');
-  let socket = net.createConnection(587, 'smtp-relay.brevo.com');
+  // Port 465 — direct TLS (no STARTTLS), more reliable on cloud hosts
+  const tls2 = require('tls');
+  const socket = tls2.connect({ host: 'smtp-relay.brevo.com', port: 465, servername: 'smtp-relay.brevo.com' });
   let step = 0;
-  let upgraded = false;
-  let tlsSocket = null;
+  let buf  = '';
 
-  function send(s) {
-    const sock = tlsSocket || socket;
-    sock.write(s + '\r\n');
-  }
+  function send(s) { socket.write(s + '\r\n'); }
 
   function handleLine(line) {
     const code = parseInt(line.slice(0, 3));
-    if (step === 0 && code === 220)  { step=1; send('EHLO tradealert'); }
-    else if (step === 1 && code === 250) {
-      if (!upgraded) { step=2; send('STARTTLS'); }
-      else if (step === 1) { step=3; send(`AUTH LOGIN`); }
-    }
-    else if (step === 2 && code === 220) {
-      // Upgrade to TLS
-      upgraded = true;
-      tlsSocket = tls.connect({ socket, servername: 'smtp-relay.brevo.com' }, () => {
-        tlsSocket.on('data', d => d.toString().split('\r\n').filter(Boolean).forEach(handleLine));
-        step = 1;
-        send('EHLO tradealert');
-      });
-    }
-    else if (step === 1 && code === 250 && upgraded) { step=3; send('AUTH LOGIN'); }
-    else if (step === 3 && code === 334) { step=4; send(Buffer.from(from).toString('base64')); }
-    else if (step === 4 && code === 334) { step=5; send(Buffer.from(BREVO_KEY).toString('base64')); }
-    else if (step === 5 && code === 235) { step=6; send(`MAIL FROM:<${from}>`); }
-    else if (step === 6 && code === 250) { step=7; send(`RCPT TO:<${to}>`); }
-    else if (step === 7 && code === 250) { step=8; send('DATA'); }
-    else if (step === 8 && code === 354) { step=9; send(message + '\r\n.'); }
-    else if (step === 9 && code === 250) {
-      log(`Alert email sent: ${subject}`);
-      send('QUIT');
-      socket.destroy();
-    }
-    else if (code >= 400) {
-      warn(`Alert email SMTP error ${code}: ${line} (step=${step})`);
-      socket.destroy();
-    }
+    if      (step === 0 && code === 220) { step=1; send('EHLO tradealert'); }
+    else if (step === 1 && code === 250) { step=2; send('AUTH LOGIN'); }
+    else if (step === 2 && code === 334) { step=3; send(Buffer.from(BREVO_USER).toString('base64')); }
+    else if (step === 3 && code === 334) { step=4; send(Buffer.from(BREVO_KEY).toString('base64')); }
+    else if (step === 4 && code === 235) { step=5; send(`MAIL FROM:<${from}>`); }
+    else if (step === 5 && code === 250) { step=6; send(`RCPT TO:<${to}>`); }
+    else if (step === 6 && code === 250) { step=7; send('DATA'); }
+    else if (step === 7 && code === 354) { step=8; send(message + '\r\n.'); }
+    else if (step === 8 && code === 250) { log(`Alert email sent: ${subject}`); send('QUIT'); socket.destroy(); }
+    else if (code >= 400) { warn(`Alert email SMTP error ${code}: ${line} (step=${step})`); socket.destroy(); }
   }
 
   socket.on('data', d => {
-    if (!upgraded) d.toString().split('\r\n').filter(Boolean).forEach(handleLine);
+    buf += d.toString();
+    const lines = buf.split('\r\n');
+    buf = lines.pop();
+    lines.filter(Boolean).forEach(handleLine);
   });
-  socket.on('error', e => warn(`Alert email socket error: ${e.message}`));
+  socket.on('error',   e => warn(`Alert email socket error: ${e.message}`));
   socket.on('timeout', () => { warn('Alert email socket timeout'); socket.destroy(); });
   socket.setTimeout(15000);
 }
