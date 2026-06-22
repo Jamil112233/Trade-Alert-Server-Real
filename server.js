@@ -48,6 +48,13 @@ const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
 const CAP_REST_URL  = 'https://api-capital.backend-capital.com';
 const CAP_WS_URL    = 'wss://api-streaming-capital.backend-capital.com/connect';
 
+// ── Brevo SMTP alert emails ───────────────────────────────────────────────────
+// Set these in Render dashboard → Environment
+const BREVO_USER    = process.env.BREVO_USER;
+const BREVO_KEY     = process.env.BREVO_KEY;
+const ALERT_TO      = process.env.ALERT_TO      || 'dev.dreamlabs.org@gmail.com';
+const ALERT_FROM    = process.env.ALERT_FROM    || 'support.dreamlabs@gmail.com';
+
 const DEV_EMAIL = 'dev.dreamlabs.org@gmail.com';
 
 // ── Logging ──────────────────────────────────────────────────────────────────
@@ -55,7 +62,92 @@ function log(msg)  { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function warn(msg) { console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`); }
 function err(msg)  { console.error(`[${new Date().toISOString()}] ❌ ${msg}`); }
 
-// ── Live price store ─────────────────────────────────────────────────────────
+// ── Server alert emails (Brevo SMTP) ─────────────────────────────────────────
+// Cooldown: each issue key can only send 1 email per 30 minutes to prevent spam
+// during retry loops or repeated failures.
+const emailCooldowns = {};
+const EMAIL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+function sendAlertEmail(issueKey, subject, body) {
+  if (!BREVO_USER || !BREVO_KEY) return; // env vars not set — skip silently
+  const now = Date.now();
+  if (emailCooldowns[issueKey] && now - emailCooldowns[issueKey] < EMAIL_COOLDOWN_MS) return;
+  emailCooldowns[issueKey] = now;
+
+  const tls  = require('tls');
+  const ts   = new Date().toISOString();
+  const from = ALERT_FROM;
+  const to   = ALERT_TO;
+  const fullBody = `${body}\n\nTime: ${ts}\nServer: TradeAlert Render`;
+
+  // Build RFC 2822 message
+  const message = [
+    `From: TradeAlert Server <${from}>`,
+    `To: ${to}`,
+    `Subject: [TradeAlert] ${subject}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    '',
+    fullBody
+  ].join('\r\n');
+
+  const b64msg = Buffer.from(message).toString('base64');
+
+  // SMTP over TLS (port 587 STARTTLS)
+  const net = require('net');
+  let socket = net.createConnection(587, 'smtp-relay.brevo.com');
+  let step = 0;
+  let upgraded = false;
+  let tlsSocket = null;
+
+  function send(s) {
+    const sock = tlsSocket || socket;
+    sock.write(s + '\r\n');
+  }
+
+  function handleLine(line) {
+    const code = parseInt(line.slice(0, 3));
+    if (step === 0 && code === 220)  { step=1; send('EHLO tradealert'); }
+    else if (step === 1 && code === 250) {
+      if (!upgraded) { step=2; send('STARTTLS'); }
+      else if (step === 1) { step=3; send(`AUTH LOGIN`); }
+    }
+    else if (step === 2 && code === 220) {
+      // Upgrade to TLS
+      upgraded = true;
+      tlsSocket = tls.connect({ socket, servername: 'smtp-relay.brevo.com' }, () => {
+        tlsSocket.on('data', d => d.toString().split('\r\n').filter(Boolean).forEach(handleLine));
+        step = 1;
+        send('EHLO tradealert');
+      });
+    }
+    else if (step === 1 && code === 250 && upgraded) { step=3; send('AUTH LOGIN'); }
+    else if (step === 3 && code === 334) { step=4; send(Buffer.from(from).toString('base64')); }
+    else if (step === 4 && code === 334) { step=5; send(Buffer.from(BREVO_KEY).toString('base64')); }
+    else if (step === 5 && code === 235) { step=6; send(`MAIL FROM:<${from}>`); }
+    else if (step === 6 && code === 250) { step=7; send(`RCPT TO:<${to}>`); }
+    else if (step === 7 && code === 250) { step=8; send('DATA'); }
+    else if (step === 8 && code === 354) { step=9; send(message + '\r\n.'); }
+    else if (step === 9 && code === 250) {
+      log(`Alert email sent: ${subject}`);
+      send('QUIT');
+      socket.destroy();
+    }
+    else if (code >= 400) {
+      warn(`Alert email SMTP error ${code}: ${line} (step=${step})`);
+      socket.destroy();
+    }
+  }
+
+  socket.on('data', d => {
+    if (!upgraded) d.toString().split('\r\n').filter(Boolean).forEach(handleLine);
+  });
+  socket.on('error', e => warn(`Alert email socket error: ${e.message}`));
+  socket.on('timeout', () => { warn('Alert email socket timeout'); socket.destroy(); });
+  socket.setTimeout(15000);
+}
+
+
 // Updated continuously by WebSocket handlers and Yahoo polling
 const livePrice = {
   // Metals (from Capital.com WebSocket)
@@ -82,6 +174,12 @@ const activeAlerts = {};
 
 // Track recently triggered to prevent double-fire
 const recentlyTriggered = new Set();
+
+// Yahoo consecutive fail counter (for email alert)
+let yahooFailCount = 0;
+
+// Gate.io WS disconnect counter (for email alert)
+let gateWsDisconnects = 0;
 
 // ── Active pair tracking ──────────────────────────────────────────────────────
 // Derived from activeAlerts — updated whenever RTDB pushes alert changes.
@@ -352,16 +450,17 @@ function startRtdbListener() {
       // Destroy immediately and wait a long time before retrying.
       if (res.statusCode === 402) {
         warn('RTDB SSE: 402 connection limit — waiting 60s before retry');
+        sendAlertEmail('rtdb_402', 'RTDB connection limit (402)', 'Firebase RTDB returned 402 — too many connections.\nWaiting 60s before retry.\nAlert monitoring is paused until reconnected.');
         res.destroy();
         connecting = false;
         failCount++;
-        scheduleReconnect(60000); // 1 minute cooldown — let other connections die
+        scheduleReconnect(60000);
         return;
       }
 
-      // Non-200 status — short backoff
       if (res.statusCode !== 200) {
         warn(`RTDB SSE: unexpected status ${res.statusCode} — retrying in 10s`);
+        if (failCount >= 3) sendAlertEmail('rtdb_error', `RTDB connection failing (${res.statusCode})`, `Firebase RTDB SSE returned status ${res.statusCode} repeatedly.\nFail count: ${failCount}\nAlert monitoring may be affected.`);
         res.destroy();
         connecting = false;
         failCount++;
@@ -411,6 +510,7 @@ function startRtdbListener() {
       warn(`RTDB SSE request error: ${e.message} — reconnecting in 10s`);
       connecting = false;
       failCount++;
+      if (failCount >= 3) sendAlertEmail('rtdb_req_error', 'RTDB connection request failing', `Firebase RTDB SSE request error (attempt ${failCount}).\nError: ${e.message}\nAlert monitoring may be affected.`);
       // Exponential backoff: 10s, 20s, 40s, max 60s
       const delay = Math.min(10000 * Math.pow(2, Math.min(failCount - 1, 3)), 60000);
       scheduleReconnect(delay);
@@ -599,8 +699,10 @@ async function createCapSession() {
       const delayS = Math.min(10 * attempt, 30);
       if (is429) {
         warn(`Capital.com session 429 too-many-requests (attempt ${attempt}) — retrying in ${delayS}s`);
+        if (attempt === 3) sendAlertEmail('cap_session_429', 'Capital.com session 429 too-many-requests', `Capital.com is rejecting session creation with 429.\nAttempt: ${attempt}\nWill keep retrying every ${delayS}s automatically.`);
       } else {
         warn(`Capital.com session failed: ${e.message} (attempt ${attempt}) — retrying in ${delayS}s`);
+        if (attempt === 2) sendAlertEmail('cap_session_fail', 'Capital.com session failed', `Capital.com session creation failed.\nError: ${e.message}\nAttempt: ${attempt}\nWill keep retrying every ${delayS}s automatically.`);
       }
       await new Promise(r => setTimeout(r, delayS * 1000));
     }
@@ -644,9 +746,11 @@ function startCapWsWatchdog() {
     const xagAge  = now - lastTickAt.XAG;
     if (lastTickAt.XAU > 0 && xauAge > staleMs) {
       warn(`Capital.com WS stale — XAU last tick ${Math.round(xauAge/1000)}s ago — force reconnecting`);
+      sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Gold (XAU) price feed stopped updating.\nLast tick: ${Math.round(xauAge/1000)}s ago.\nAuto-reconnecting now — prices may have been stale for up to 2 minutes.`);
       reconnectCapWs();
     } else if (lastTickAt.XAG > 0 && xagAge > staleMs) {
       warn(`Capital.com WS stale — XAG last tick ${Math.round(xagAge/1000)}s ago — force reconnecting`);
+      sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Silver (XAG) price feed stopped updating.\nLast tick: ${Math.round(xagAge/1000)}s ago.\nAuto-reconnecting now.`);
       reconnectCapWs();
     }
   }, 60 * 1000);
@@ -875,7 +979,9 @@ function connectGateWs() {
     gateWsConnected = false;
     gateSubscribedPairs = new Set();
     if (gateWs._ping) { clearInterval(gateWs._ping); gateWs._ping = null; }
-    warn(`Gate.io WS closed ${code} — reconnecting in 5s`);
+    gateWsDisconnects = (gateWsDisconnects || 0) + 1;
+    warn(`Gate.io WS closed ${code} — reconnecting in 5s (disconnect #${gateWsDisconnects})`);
+    if (gateWsDisconnects % 5 === 0) sendAlertEmail('gate_ws_disconnect', 'Gate.io WS repeatedly disconnecting', `Gate.io WebSocket has disconnected ${gateWsDisconnects} times.\nLast close code: ${code}\nCrypto prices may be intermittently unavailable.`);
     setTimeout(connectGateWs, 5000);
   });
 
@@ -977,6 +1083,12 @@ async function pollYahoo() {
     }
   }
   log(`Yahoo: ${updated}/${toFetch.length} updated (${toFetch.join(', ')}). EURUSD=${livePrice.EURUSD} SPX500=${livePrice.SPX500}`);
+  if (updated === 0 && toFetch.length > 0) {
+    yahooFailCount = (yahooFailCount || 0) + 1;
+    if (yahooFailCount === 5) sendAlertEmail('yahoo_fail', 'Yahoo Finance polling failing', `Yahoo Finance returned no prices for ${toFetch.length} symbols (${toFetch.join(', ')}) for 5 consecutive polls.\nForex and index alerts may not be triggering correctly.`);
+  } else {
+    yahooFailCount = 0;
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1009,8 +1121,12 @@ let serverStopped = false;
 async function checkServerStopFlag() {
   try {
     const val = await rtdbGet('worker_control/stop');
+    const wasStopped = serverStopped;
     serverStopped = val === true || val === 'true';
-    if (serverStopped) log('Server stop flag is TRUE — only dev alerts will be checked');
+    if (serverStopped) {
+      log('Server stop flag is TRUE — only dev alerts will be checked');
+      if (!wasStopped) sendAlertEmail('server_stopped', 'TradeAlert server STOPPED', 'The server stop flag has been set to TRUE in Firebase.\nAll user alerts are paused — only dev alerts are being checked.\nSet worker_control/stop = false in RTDB to resume.');
+    }
   } catch(e) { /* keep current state */ }
 }
 
@@ -1433,6 +1549,16 @@ async function updateRtdbPrices() {
 function startHealthServer() {
   const port = process.env.PORT || 3000;
   http.createServer((req, res) => {
+    // Test email endpoint — hit this URL in browser to verify email alerts work
+    if (req.url === '/test-email') {
+      sendAlertEmail('test', 'TradeAlert server email test', 'This is a test email from your TradeAlert server.\nIf you received this, email alerts are working correctly.');
+      // Reset cooldown immediately so a real alert can still fire
+      delete emailCooldowns['test'];
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('Test email sent to ' + ALERT_TO + ' — check your inbox.');
+      return;
+    }
+
     const status = {
       ok:          true,
       alerts:      Object.keys(activeAlerts).length,
