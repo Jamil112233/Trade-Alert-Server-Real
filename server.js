@@ -69,59 +69,46 @@ const emailCooldowns = {};
 const EMAIL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
 function sendAlertEmail(issueKey, subject, body) {
-  if (!BREVO_USER || !BREVO_KEY) return; // env vars not set — skip silently
+  if (!BREVO_KEY) return; // env var not set — skip silently
   const now = Date.now();
   if (emailCooldowns[issueKey] && now - emailCooldowns[issueKey] < EMAIL_COOLDOWN_MS) return;
   emailCooldowns[issueKey] = now;
 
-  const tls  = require('tls');
-  const ts   = new Date().toISOString();
-  const from = ALERT_FROM;
-  const to   = ALERT_TO;
+  const ts       = new Date().toISOString();
   const fullBody = `${body}\n\nTime: ${ts}\nServer: TradeAlert Render`;
 
-  // Build RFC 2822 message
-  const message = [
-    `From: TradeAlert Server <${from}>`,
-    `To: ${to}`,
-    `Subject: [TradeAlert] ${subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset=UTF-8',
-    '',
-    fullBody
-  ].join('\r\n');
-
-  // Port 465 — direct TLS (no STARTTLS), more reliable on cloud hosts
-  const tls2 = require('tls');
-  const socket = tls2.connect({ host: 'smtp-relay.brevo.com', port: 465, servername: 'smtp-relay.brevo.com' });
-  let step = 0;
-  let buf  = '';
-
-  function send(s) { socket.write(s + '\r\n'); }
-
-  function handleLine(line) {
-    const code = parseInt(line.slice(0, 3));
-    if      (step === 0 && code === 220) { step=1; send('EHLO tradealert'); }
-    else if (step === 1 && code === 250) { step=2; send('AUTH LOGIN'); }
-    else if (step === 2 && code === 334) { step=3; send(Buffer.from(BREVO_USER).toString('base64')); }
-    else if (step === 3 && code === 334) { step=4; send(Buffer.from(BREVO_KEY).toString('base64')); }
-    else if (step === 4 && code === 235) { step=5; send(`MAIL FROM:<${from}>`); }
-    else if (step === 5 && code === 250) { step=6; send(`RCPT TO:<${to}>`); }
-    else if (step === 6 && code === 250) { step=7; send('DATA'); }
-    else if (step === 7 && code === 354) { step=8; send(message + '\r\n.'); }
-    else if (step === 8 && code === 250) { log(`Alert email sent: ${subject}`); send('QUIT'); socket.destroy(); }
-    else if (code >= 400) { warn(`Alert email SMTP error ${code}: ${line} (step=${step})`); socket.destroy(); }
-  }
-
-  socket.on('data', d => {
-    buf += d.toString();
-    const lines = buf.split('\r\n');
-    buf = lines.pop();
-    lines.filter(Boolean).forEach(handleLine);
+  // Use Brevo HTTP API (port 443) — SMTP ports 587/465 are blocked on Render free plan
+  const payload = JSON.stringify({
+    sender:   { name: 'TradeAlert Server', email: ALERT_FROM },
+    to:       [{ email: ALERT_TO }],
+    subject:  `[TradeAlert] ${subject}`,
+    textContent: fullBody
   });
-  socket.on('error',   e => warn(`Alert email socket error: ${e.message}`));
-  socket.on('timeout', () => { warn('Alert email socket timeout'); socket.destroy(); });
-  socket.setTimeout(15000);
+
+  const req = https.request({
+    hostname: 'api.brevo.com',
+    port:     443,
+    path:     '/v3/smtp/email',
+    method:   'POST',
+    headers:  {
+      'api-key':       BREVO_KEY,
+      'Content-Type':  'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  }, res => {
+    let d = '';
+    res.on('data', c => d += c);
+    res.on('end', () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        log(`Alert email sent: ${subject}`);
+      } else {
+        warn(`Alert email API error ${res.statusCode}: ${d}`);
+      }
+    });
+  });
+  req.on('error', e => warn(`Alert email request error: ${e.message}`));
+  req.write(payload);
+  req.end();
 }
 
 
