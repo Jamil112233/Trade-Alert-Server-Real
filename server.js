@@ -554,45 +554,57 @@ const lastTickAt = { XAU: 0, XAG: 0 };
 const metalCloseSnapshot = { XAU: {}, XAG: {} };
 
 async function createCapSession() {
-  log('Creating Capital.com session...');
-  const res = await fetchJson(`${CAP_REST_URL}/api/v1/session`, {
-    method:  'POST',
-    headers: { 'X-CAP-API-KEY': CAP_API_KEY },
-    body:    JSON.stringify({ identifier: CAP_EMAIL, password: CAP_PASSWORD, encryptedPassword: false })
-  });
-
-  // Headers come back on the raw response — use http.request directly
-  return new Promise((resolve, reject) => {
-    const u    = new URL(`${CAP_REST_URL}/api/v1/session`);
-    const body = JSON.stringify({ identifier: CAP_EMAIL, password: CAP_PASSWORD, encryptedPassword: false });
-    const req  = https.request({
-      hostname: u.hostname,
-      port:     443,
-      path:     u.pathname,
-      method:   'POST',
-      headers:  {
-        'X-CAP-API-KEY':  CAP_API_KEY,
-        'Content-Type':   'application/json',
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, res => {
-      capCst   = res.headers['cst'];
-      capToken = res.headers['x-security-token'];
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        if (res.statusCode === 200 && capCst && capToken) {
-          log('Capital.com session created');
-          resolve();
-        } else {
-          reject(new Error(`Capital.com session failed: ${res.statusCode} ${d}`));
-        }
+  // Retry loop — Capital.com returns 429 (too-many-requests) on session create,
+  // especially after a reconnect. Keep retrying with increasing delays until success.
+  // Delays: 10s, 20s, 30s, 30s, 30s... (caps at 30s)
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    log(`Creating Capital.com session (attempt ${attempt})...`);
+    try {
+      await new Promise((resolve, reject) => {
+        const u    = new URL(`${CAP_REST_URL}/api/v1/session`);
+        const body = JSON.stringify({ identifier: CAP_EMAIL, password: CAP_PASSWORD, encryptedPassword: false });
+        const req  = https.request({
+          hostname: u.hostname,
+          port:     443,
+          path:     u.pathname,
+          method:   'POST',
+          headers:  {
+            'X-CAP-API-KEY':  CAP_API_KEY,
+            'Content-Type':   'application/json',
+            'Content-Length': Buffer.byteLength(body)
+          }
+        }, res => {
+          capCst   = res.headers['cst'];
+          capToken = res.headers['x-security-token'];
+          let d = '';
+          res.on('data', c => d += c);
+          res.on('end', () => {
+            if (res.statusCode === 200 && capCst && capToken) {
+              log('Capital.com session created');
+              resolve();
+            } else {
+              reject(new Error(`${res.statusCode} ${d}`));
+            }
+          });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
       });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
+      return; // success — exit loop
+    } catch (e) {
+      const is429 = e.message.startsWith('429');
+      const delayS = Math.min(10 * attempt, 30);
+      if (is429) {
+        warn(`Capital.com session 429 too-many-requests (attempt ${attempt}) — retrying in ${delayS}s`);
+      } else {
+        warn(`Capital.com session failed: ${e.message} (attempt ${attempt}) — retrying in ${delayS}s`);
+      }
+      await new Promise(r => setTimeout(r, delayS * 1000));
+    }
+  }
 }
 
 async function pingCapSession() {
