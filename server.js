@@ -1,5 +1,5 @@
 /**
- * Trade Alert — Combined Server (Bandwidth-Optimized)
+ * Trade Alert — Combined Server (Bandwidth-Optimized
  * Runs 24/7 on Render (Web Service, port required).
  *
  * Replaces:  price-bridge.js  +  Cloudflare Worker
