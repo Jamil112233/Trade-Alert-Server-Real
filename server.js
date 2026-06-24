@@ -703,7 +703,14 @@ async function pingCapSession() {
 // silently stalled — force-reconnect immediately so users aren't stuck on a stale price.
 function startCapWsWatchdog() {
   setInterval(() => {
-    if (!isMetalsOpen()) return; // market closed — no ticks expected
+    if (!isMetalsOpen()) {
+      // Market closed — reset tick timestamps so watchdog doesn't fire
+      // immediately at next market open (no ticks expected while closed).
+      lastTickAt.XAU = 0;
+      lastTickAt.XAG = 0;
+      return;
+    }
+    if (capWsReconnecting) return; // already reconnecting — don't pile on
     const now     = Date.now();
     const staleMs = 2 * 60 * 1000; // 2 minutes
     const xauAge  = now - lastTickAt.XAU;
@@ -711,10 +718,14 @@ function startCapWsWatchdog() {
     if (lastTickAt.XAU > 0 && xauAge > staleMs) {
       warn(`Capital.com WS stale — XAU last tick ${Math.round(xauAge/1000)}s ago — force reconnecting`);
       sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Gold (XAU) price feed stopped updating.\nLast tick: ${Math.round(xauAge/1000)}s ago.\nAuto-reconnecting now — prices may have been stale for up to 2 minutes.`);
+      lastTickAt.XAU = Date.now(); // reset so we don't re-trigger next minute during reconnect
+      lastTickAt.XAG = Date.now();
       reconnectCapWs();
     } else if (lastTickAt.XAG > 0 && xagAge > staleMs) {
       warn(`Capital.com WS stale — XAG last tick ${Math.round(xagAge/1000)}s ago — force reconnecting`);
       sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Silver (XAG) price feed stopped updating.\nLast tick: ${Math.round(xagAge/1000)}s ago.\nAuto-reconnecting now.`);
+      lastTickAt.XAU = Date.now();
+      lastTickAt.XAG = Date.now();
       reconnectCapWs();
     }
   }, 60 * 1000);
@@ -789,16 +800,33 @@ function connectCapWs() {
 
   capWs.on('close', (code, reason) => {
     if (capWs._ping) { clearInterval(capWs._ping); capWs._ping = null; }
+    // Only reschedule if this close was NOT triggered by our own terminate() call.
+    // reconnectCapWs sets capWs=null before terminate, so if capWs is null here
+    // it means we intentionally closed it — don't spawn another reconnect.
+    if (capWsReconnecting) return; // reconnect already scheduled/running
     warn(`Capital.com WS closed ${code} — reconnecting in 5s`);
-    setTimeout(reconnectCapWs, 5000);
+    capWsReconnecting = true;
+    setTimeout(() => { capWsReconnecting = false; reconnectCapWs(); }, 5000);
   });
 
   capWs.on('error', e => warn(`Capital.com WS error: ${e.message}`));
 }
 
+let capWsReconnecting = false;
+
 function reconnectCapWs() {
-  if (capWs) { try { capWs.terminate(); } catch {} capWs = null; }
-  connectCapWs();
+  if (capWsReconnecting) return; // already in progress — don't stack
+  capWsReconnecting = true;
+  if (capWs) {
+    capWs.removeAllListeners(); // prevent close handler from spawning another reconnect
+    try { capWs.terminate(); } catch {}
+    capWs = null;
+  }
+  // Small delay before connecting to let Capital.com breathe
+  setTimeout(() => {
+    capWsReconnecting = false;
+    connectCapWs();
+  }, 1000);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
