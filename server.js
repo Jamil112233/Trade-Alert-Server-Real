@@ -217,7 +217,14 @@ function isForexOpen() {
 
 // XAU/XAG follow the same weekly trading session as forex (Capital.com).
 function isMetalsOpen() {
-  return isForexOpen();
+  // Gold/silver follow the forex weekly session but also have a daily ~1hr maintenance
+  // break around 21:00-22:00 UTC (2:00-3:00 AM PKT) every weekday.
+  // We use 20:55-22:05 UTC as the closed window to give a buffer on both sides.
+  if (!isForexOpen()) return false;
+  const now  = new Date();
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (mins >= 20*60+55 && mins < 22*60+5) return false; // daily break
+  return true;
 }
 
 function isIndexOpen(sym) {
@@ -715,15 +722,26 @@ function startCapWsWatchdog() {
     const staleMs = 2 * 60 * 1000; // 2 minutes
     const xauAge  = now - lastTickAt.XAU;
     const xagAge  = now - lastTickAt.XAG;
+
+    // Don't alert if we haven't received ANY ticks yet since server start or market open
+    // (lastTickAt=0 means market just opened or server just started — give it time)
+    if (lastTickAt.XAU === 0 && lastTickAt.XAG === 0) return;
+
     if (lastTickAt.XAU > 0 && xauAge > staleMs) {
       warn(`Capital.com WS stale — XAU last tick ${Math.round(xauAge/1000)}s ago — force reconnecting`);
-      sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Gold (XAU) price feed stopped updating.\nLast tick: ${Math.round(xauAge/1000)}s ago.\nAuto-reconnecting now — prices may have been stale for up to 2 minutes.`);
+      // Only email if stale for more than 5 minutes — avoids false alarms on brief
+      // daily maintenance windows (gold closes ~1hr around 21:00 UTC daily)
+      if (xauAge > 5 * 60 * 1000) {
+        sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Gold (XAU) price feed stopped updating.\nLast tick: ${Math.round(xauAge/1000)}s ago.\nAuto-reconnecting now — prices may have been stale for up to ${Math.round(xauAge/60000)} minutes.`);
+      }
       lastTickAt.XAU = Date.now(); // reset so we don't re-trigger next minute during reconnect
       lastTickAt.XAG = Date.now();
       reconnectCapWs();
     } else if (lastTickAt.XAG > 0 && xagAge > staleMs) {
       warn(`Capital.com WS stale — XAG last tick ${Math.round(xagAge/1000)}s ago — force reconnecting`);
-      sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Silver (XAG) price feed stopped updating.\nLast tick: ${Math.round(xagAge/1000)}s ago.\nAuto-reconnecting now.`);
+      if (xagAge > 5 * 60 * 1000) {
+        sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Silver (XAG) price feed stopped updating.\nLast tick: ${Math.round(xagAge/1000)}s ago.\nAuto-reconnecting now.`);
+      }
       lastTickAt.XAU = Date.now();
       lastTickAt.XAG = Date.now();
       reconnectCapWs();
