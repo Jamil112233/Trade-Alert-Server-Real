@@ -1583,11 +1583,14 @@ async function main() {
   startHealthServer();
   startRtdbListener();
 
-  // Capital.com WebSocket for metals
-  await createCapSession();
-  connectCapWs();
+  // Capital.com WebSocket for metals — session creation retries forever on 429/503,
+  // so run it in the background. Gate.io, Yahoo, and alert checking start immediately
+  // and don't depend on Capital.com being up.
+  createCapSession().then(() => {
+    connectCapWs();
+  }).catch(e => warn(`Cap session initial error: ${e.message}`)); // won't fire — retries forever
   setInterval(pingCapSession, 9 * 60 * 1000);
-  startCapWsWatchdog(); // detects silent stalls — force reconnects if no tick for 2min
+  startCapWsWatchdog();
 
   // Gate.io WebSocket for instant crypto prices
   connectGateWs();
