@@ -1,5 +1,5 @@
 /**
- * Trade Alert — Combined Server (Bandwidth-Optimized
+ * Trade Alert — Combined Server (Bandwidth-Optimized)
  * Runs 24/7 on Render (Web Service, port required).
  *
  * Replaces:  price-bridge.js  +  Cloudflare Worker
@@ -1482,8 +1482,8 @@ async function sendFCM(userId, alert, hitPrice) {
         isAlarm:      String(isAlarm),
         hitType,
         hitTime:      String(Date.now()),
-        vibration:    String(alert.vibrationEnabled !== false),
-        sound:        String(alert.soundEnabled !== false),
+        isVibration:    String(alert.vibrationEnabled !== false),
+        isSoundEnabled: String(alert.soundEnabled !== false),
       },
       // notification field intentionally omitted for ALL message types.
       // Sending a notification field causes Android to show a system-generated
