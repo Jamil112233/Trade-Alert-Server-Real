@@ -1398,20 +1398,18 @@ async function processTriggeredAlert(alert, hitPrice) {
   } catch(e) { warn(`  RTDB delete failed: ${e.message}`); }
 
   // 2. Delete from Firestore active_alerts field
+  // Uses PATCH with updateMask — the correct REST API way to delete a single field.
+  // The field is omitted from the body; updateMask tells Firestore which fields to
+  // overwrite, so the field is effectively deleted (set to nothing).
   try {
     const token   = await getAccessToken();
-    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
+    const docUrl  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
     const res2 = await fetchJson(
-      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      `${docUrl}?updateMask.fieldPaths=${encodeURIComponent('`' + alertId + '`')}`,
       {
-        method:  'POST',
-        headers: { 'Authorization': `Bearer ${token}` },
-        body:    JSON.stringify({
-          writes: [{
-            update:     { name: docPath, fields: {} },
-            updateMask: { fieldPaths: ['`' + alertId + '`'] }
-          }]
-        })
+        method:  'PATCH',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ fields: {} })
       }
     );
     if (res2?.error) warn(`  Firestore active_alerts delete error: ${JSON.stringify(res2.error)}`);
