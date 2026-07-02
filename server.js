@@ -1416,22 +1416,57 @@ async function processTriggeredAlert(alert, hitPrice) {
   } catch(e) { warn(`  RTDB delete failed: ${e.message}`); }
 
   // 2. Delete from Firestore active_alerts field
-  // Uses PATCH with updateMask — the correct REST API way to delete a single field.
-  // The field is omitted from the body; updateMask tells Firestore which fields to
-  // overwrite, so the field is effectively deleted (set to nothing).
+  // Uses commit API with an update + updateMask where the field is absent from the
+  // body but present in the mask — this is the only reliable way to delete a single
+  // map field via REST. We also verify the response explicitly.
   try {
     const token   = await getAccessToken();
-    const docUrl  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
+    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
     const res2 = await fetchJson(
-      `${docUrl}?updateMask.fieldPaths=${encodeURIComponent('`' + alertId + '`')}`,
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
       {
-        method:  'PATCH',
+        method:  'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ fields: {} })
+        body:    JSON.stringify({
+          writes: [{
+            update:     { name: docPath, fields: {} },
+            updateMask: { fieldPaths: [`\`${alertId}\``] }
+          }]
+        })
       }
     );
-    if (res2?.error) warn(`  Firestore active_alerts delete error: ${JSON.stringify(res2.error)}`);
-    else log(`  Firestore active_alerts field deleted: ${alertId}`);
+    if (res2?.error) {
+      warn(`  Firestore active_alerts delete error: ${JSON.stringify(res2.error)}`);
+    } else if (!res2?.writeResults) {
+      warn(`  Firestore active_alerts delete unexpected response: ${JSON.stringify(res2)}`);
+    } else {
+      log(`  Firestore active_alerts field deleted: ${alertId}`);
+      // Verify the field is actually gone
+      const verifyRes = await fetchJson(
+        `https://firestore.googleapis.com/v1/${docPath}`,
+        { headers: { 'Authorization': `Bearer ${token}` } }
+      );
+      if (verifyRes?.fields?.[alertId]) {
+        warn(`  Firestore delete verification FAILED — field still exists: ${alertId} — retrying`);
+        // Retry once more
+        await fetchJson(
+          `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+          {
+            method:  'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body:    JSON.stringify({
+              writes: [{
+                update:     { name: docPath, fields: {} },
+                updateMask: { fieldPaths: [`\`${alertId}\``] }
+              }]
+            })
+          }
+        );
+        log(`  Firestore active_alerts delete retried: ${alertId}`);
+      } else {
+        log(`  Firestore active_alerts delete verified OK: ${alertId}`);
+      }
+    }
   } catch(e) { warn(`  Firestore active_alerts delete failed: ${e.message}`); }
 
   // 3. Write to Firestore history field
