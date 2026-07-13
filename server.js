@@ -217,14 +217,7 @@ function isForexOpen() {
 
 // XAU/XAG follow the same weekly trading session as forex (Capital.com).
 function isMetalsOpen() {
-  // Gold/silver follow the forex weekly session but also have a daily ~1hr maintenance
-  // break around 21:00-22:00 UTC (2:00-3:00 AM PKT) every weekday.
-  // We use 20:55-22:05 UTC as the closed window to give a buffer on both sides.
-  if (!isForexOpen()) return false;
-  const now  = new Date();
-  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (mins >= 20*60+55 && mins < 22*60+5) return false; // daily break
-  return true;
+  return isForexOpen();
 }
 
 function isIndexOpen(sym) {
@@ -722,26 +715,15 @@ function startCapWsWatchdog() {
     const staleMs = 2 * 60 * 1000; // 2 minutes
     const xauAge  = now - lastTickAt.XAU;
     const xagAge  = now - lastTickAt.XAG;
-
-    // Don't alert if we haven't received ANY ticks yet since server start or market open
-    // (lastTickAt=0 means market just opened or server just started — give it time)
-    if (lastTickAt.XAU === 0 && lastTickAt.XAG === 0) return;
-
     if (lastTickAt.XAU > 0 && xauAge > staleMs) {
       warn(`Capital.com WS stale — XAU last tick ${Math.round(xauAge/1000)}s ago — force reconnecting`);
-      // Only email if stale for more than 5 minutes — avoids false alarms on brief
-      // daily maintenance windows (gold closes ~1hr around 21:00 UTC daily)
-      if (xauAge > 5 * 60 * 1000) {
-        sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Gold (XAU) price feed stopped updating.\nLast tick: ${Math.round(xauAge/1000)}s ago.\nAuto-reconnecting now — prices may have been stale for up to ${Math.round(xauAge/60000)} minutes.`);
-      }
+      sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Gold (XAU) price feed stopped updating.\nLast tick: ${Math.round(xauAge/1000)}s ago.\nAuto-reconnecting now — prices may have been stale for up to 2 minutes.`);
       lastTickAt.XAU = Date.now(); // reset so we don't re-trigger next minute during reconnect
       lastTickAt.XAG = Date.now();
       reconnectCapWs();
     } else if (lastTickAt.XAG > 0 && xagAge > staleMs) {
       warn(`Capital.com WS stale — XAG last tick ${Math.round(xagAge/1000)}s ago — force reconnecting`);
-      if (xagAge > 5 * 60 * 1000) {
-        sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Silver (XAG) price feed stopped updating.\nLast tick: ${Math.round(xagAge/1000)}s ago.\nAuto-reconnecting now.`);
-      }
+      sendAlertEmail('cap_ws_stale', 'Capital.com WS price feed stalled', `Silver (XAG) price feed stopped updating.\nLast tick: ${Math.round(xagAge/1000)}s ago.\nAuto-reconnecting now.`);
       lastTickAt.XAU = Date.now();
       lastTickAt.XAG = Date.now();
       reconnectCapWs();
@@ -1416,55 +1398,42 @@ async function processTriggeredAlert(alert, hitPrice) {
   } catch(e) { warn(`  RTDB delete failed: ${e.message}`); }
 
   // 2. Delete from Firestore active_alerts field
-  // Uses commit API with an update + updateMask where the field is absent from the
-  // body but present in the mask — this is the only reliable way to delete a single
-  // map field via REST. We also verify the response explicitly.
+  // Strategy: read the full document, remove the field locally, write entire fields map back.
+  // This is the only 100% reliable way via REST — the commit/updateMask approach
+  // silently succeeds (returns writeResults) but sometimes doesn't delete the field.
   try {
     const token   = await getAccessToken();
-    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
-    const res2 = await fetchJson(
-      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
-      {
-        method:  'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          writes: [{
-            update:     { name: docPath, fields: {} },
-            updateMask: { fieldPaths: [`\`${alertId}\``] }
-          }]
-        })
-      }
-    );
-    if (res2?.error) {
-      warn(`  Firestore active_alerts delete error: ${JSON.stringify(res2.error)}`);
-    } else if (!res2?.writeResults) {
-      warn(`  Firestore active_alerts delete unexpected response: ${JSON.stringify(res2)}`);
+    const docUrl  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
+    const authHdr = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+    // Read current document
+    const readRes = await fetchJson(docUrl, { headers: authHdr });
+    if (readRes?.error) {
+      warn(`  Firestore active_alerts read error: ${JSON.stringify(readRes.error)}`);
     } else {
-      log(`  Firestore active_alerts field deleted: ${alertId}`);
-      // Verify the field is actually gone
-      const verifyRes = await fetchJson(
-        `https://firestore.googleapis.com/v1/${docPath}`,
-        { headers: { 'Authorization': `Bearer ${token}` } }
-      );
-      if (verifyRes?.fields?.[alertId]) {
-        warn(`  Firestore delete verification FAILED — field still exists: ${alertId} — retrying`);
-        // Retry once more
-        await fetchJson(
-          `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
-          {
-            method:  'POST',
-            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-            body:    JSON.stringify({
-              writes: [{
-                update:     { name: docPath, fields: {} },
-                updateMask: { fieldPaths: [`\`${alertId}\``] }
-              }]
-            })
+      // Remove the target field from the fields map
+      const fields = { ...(readRes?.fields || {}) };
+      if (fields[alertId]) {
+        delete fields[alertId];
+        // Write back the full fields map — this overwrites the entire document
+        // so the deleted field is guaranteed gone
+        const writeRes = await fetchJson(docUrl, {
+          method:  'PATCH',
+          headers: authHdr,
+          body:    JSON.stringify({ fields })
+        });
+        if (writeRes?.error) {
+          warn(`  Firestore active_alerts write-back error: ${JSON.stringify(writeRes.error)}`);
+        } else {
+          // Verify field is actually gone
+          if (writeRes?.fields?.[alertId]) {
+            warn(`  Firestore active_alerts delete STILL present after write-back: ${alertId}`);
+          } else {
+            log(`  Firestore active_alerts field deleted: ${alertId}`);
           }
-        );
-        log(`  Firestore active_alerts delete retried: ${alertId}`);
+        }
       } else {
-        log(`  Firestore active_alerts delete verified OK: ${alertId}`);
+        log(`  Firestore active_alerts field already absent: ${alertId}`);
       }
     }
   } catch(e) { warn(`  Firestore active_alerts delete failed: ${e.message}`); }
@@ -1636,14 +1605,11 @@ async function main() {
   startHealthServer();
   startRtdbListener();
 
-  // Capital.com WebSocket for metals — session creation retries forever on 429/503,
-  // so run it in the background. Gate.io, Yahoo, and alert checking start immediately
-  // and don't depend on Capital.com being up.
-  createCapSession().then(() => {
-    connectCapWs();
-  }).catch(e => warn(`Cap session initial error: ${e.message}`)); // won't fire — retries forever
+  // Capital.com WebSocket for metals
+  await createCapSession();
+  connectCapWs();
   setInterval(pingCapSession, 9 * 60 * 1000);
-  startCapWsWatchdog();
+  startCapWsWatchdog(); // detects silent stalls — force reconnects if no tick for 2min
 
   // Gate.io WebSocket for instant crypto prices
   connectGateWs();
