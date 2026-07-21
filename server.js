@@ -1660,14 +1660,14 @@ async function main() {
   startRtdbListener();
 
   // Safety-net REST poll for alerts — self-heals activeAlerts if the SSE
-  // stream above silently fails to deliver data (as happened in production).
+  // stream above silently fails to deliver data (as happened once in production).
   // This is NOT the primary sync path — SSE already does exactly what we want
   // (full load once on connect, then only per-alert deltas after that, so
-  // bandwidth stays low as alert count grows). This poll just runs occasionally
-  // in the background as a reconciliation check, so a long interval is fine —
+  // bandwidth stays low as alert count grows). SSE is now confirmed working,
+  // so this only needs to be an occasional background reconciliation check —
   // worst case an SSE outage takes up to this long to self-heal.
   pollAlertsFallback();
-  setInterval(pollAlertsFallback, 3 * 60 * 1000); // every 3 minutes
+  setInterval(pollAlertsFallback, 60 * 60 * 1000); // every 1 hour
 
   // Capital.com WebSocket for metals
   await createCapSession();
