@@ -40,7 +40,11 @@ const WebSocket = require('ws');
 const CAP_EMAIL    = process.env.CAP_EMAIL;
 const CAP_PASSWORD = process.env.CAP_PASSWORD;
 const CAP_API_KEY  = process.env.CAP_API_KEY;
-const FIREBASE_URL = process.env.FIREBASE_URL;       // RTDB base URL
+// Strip trailing slash(es) — every call site below does `${FIREBASE_URL}/path`,
+// so a trailing slash in the env var silently produces "//path" which Firebase
+// treats as a different (empty) path. This caused a real production bug where
+// RTDB connected successfully (200) but returned zero alerts.
+const FIREBASE_URL = (process.env.FIREBASE_URL || '').replace(/\/+$/, '');       // RTDB base URL
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET; // RTDB secret for writes
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
 const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
