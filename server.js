@@ -40,11 +40,7 @@ const WebSocket = require('ws');
 const CAP_EMAIL    = process.env.CAP_EMAIL;
 const CAP_PASSWORD = process.env.CAP_PASSWORD;
 const CAP_API_KEY  = process.env.CAP_API_KEY;
-// Strip trailing slash(es) — every call site below does `${FIREBASE_URL}/path`,
-// so a trailing slash in the env var silently produces "//path" which Firebase
-// treats as a different (empty) path. This caused a real production bug where
-// RTDB connected successfully (200) but returned zero alerts.
-const FIREBASE_URL = (process.env.FIREBASE_URL || '').replace(/\/+$/, '');       // RTDB base URL
+const FIREBASE_URL = process.env.FIREBASE_URL;       // RTDB base URL
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET; // RTDB secret for writes
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
 const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -124,11 +120,9 @@ const livePrice = {
   BTC:0, ETH:0, BNB:0, SOL:0, XRP:0, ADA:0, DOGE:0, AVAX:0,
   DOT:0, MATIC:0, LINK:0, UNI:0, ATOM:0, LTC:0, BCH:0, NEAR:0,
   ARB:0, OP:0, SHIB:0, TRX:0,
-  SUI:0, APT:0, PEPE:0, ICP:0, INJ:0, FIL:0, HBAR:0,
   // Indices + Forex (from Yahoo polling)
   SPX500:0, US30:0, US100:0, DXY:0, NIF50:0,
   EURUSD:0, GBPUSD:0, USDJPY:0, GBPJPY:0, AUDUSD:0, USDGBP:0, // USDGBP derived as 1/GBPUSD
-  USDCAD:0, USDCHF:0, NZDUSD:0, EURJPY:0,
 };
 
 // M1 OHLC for miss-hit detection (previous closed candle high/low)
@@ -199,8 +193,7 @@ const INDEX_HOURS_UTC = {
   NIF50:  { days: [1,2,3,4,5], open: 3*60+45,  close: 10*60 },
 };
 
-const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP',
-  'USDCAD','USDCHF','NZDUSD','EURJPY']);
+const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP']);
 
 function isWeekend() {
   const day = new Date().getUTCDay(); // 0=Sun, 6=Sat
@@ -845,9 +838,7 @@ const GATE_SYMBOLS = {
   XRP:'XRP_USDT', ADA:'ADA_USDT', DOGE:'DOGE_USDT', AVAX:'AVAX_USDT',
   DOT:'DOT_USDT', MATIC:'POL_USDT', LINK:'LINK_USDT', UNI:'UNI_USDT',
   ATOM:'ATOM_USDT', LTC:'LTC_USDT', BCH:'BCH_USDT', NEAR:'NEAR_USDT',
-  ARB:'ARB_USDT', OP:'OP_USDT', SHIB:'SHIB_USDT', TRX:'TRX_USDT',
-  SUI:'SUI_USDT', APT:'APT_USDT', PEPE:'PEPE_USDT',
-  ICP:'ICP_USDT', INJ:'INJ_USDT', FIL:'FIL_USDT', HBAR:'HBAR_USDT'
+  ARB:'ARB_USDT', OP:'OP_USDT', SHIB:'SHIB_USDT', TRX:'TRX_USDT'
 };
 
 const GATE_REVERSE = {};
@@ -861,9 +852,7 @@ const MEXC_SYMBOLS = {
   XRP:'XRPUSDT', ADA:'ADAUSDT', DOGE:'DOGEUSDT', AVAX:'AVAXUSDT',
   DOT:'DOTUSDT', MATIC:'MATICUSDT', LINK:'LINKUSDT', UNI:'UNIUSDT',
   ATOM:'ATOMUSDT', LTC:'LTCUSDT', BCH:'BCHUSDT', NEAR:'NEARUSDT',
-  ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT',
-  SUI:'SUIUSDT', APT:'APTUSDT', PEPE:'PEPEUSDT',
-  ICP:'ICPUSDT', INJ:'INJUSDT', FIL:'FILUSDT', HBAR:'HBARUSDT'
+  ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT'
 };
 
 let gateWs = null;
@@ -1024,8 +1013,7 @@ const YAHOO_SYMBOLS = {
   SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5ENDX',
   DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
   EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
-  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X',
-  USDCAD: 'USDCAD=X', USDCHF: 'USDCHF=X', NZDUSD: 'NZDUSD=X', EURJPY: 'EURJPY=X'
+  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X'
   // USDGBP is derived from GBPUSD (1/GBPUSD) — not a separate Yahoo fetch
 };
 
