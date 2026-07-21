@@ -40,7 +40,11 @@ const WebSocket = require('ws');
 const CAP_EMAIL    = process.env.CAP_EMAIL;
 const CAP_PASSWORD = process.env.CAP_PASSWORD;
 const CAP_API_KEY  = process.env.CAP_API_KEY;
-const FIREBASE_URL = process.env.FIREBASE_URL;       // RTDB base URL
+// Strip trailing slash(es) — every call site below does `${FIREBASE_URL}/path`,
+// so a trailing slash in the env var silently produces "//path" which Firebase
+// treats as a different (empty) path. This caused a real production bug where
+// RTDB connected successfully (200) but returned zero alerts.
+const FIREBASE_URL = (process.env.FIREBASE_URL || '').replace(/\/+$/, '');       // RTDB base URL
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET; // RTDB secret for writes
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
 const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -120,9 +124,11 @@ const livePrice = {
   BTC:0, ETH:0, BNB:0, SOL:0, XRP:0, ADA:0, DOGE:0, AVAX:0,
   DOT:0, MATIC:0, LINK:0, UNI:0, ATOM:0, LTC:0, BCH:0, NEAR:0,
   ARB:0, OP:0, SHIB:0, TRX:0,
+  SUI:0, APT:0, PEPE:0, ICP:0, INJ:0, FIL:0, HBAR:0,
   // Indices + Forex (from Yahoo polling)
   SPX500:0, US30:0, US100:0, DXY:0, NIF50:0,
   EURUSD:0, GBPUSD:0, USDJPY:0, GBPJPY:0, AUDUSD:0, USDGBP:0, // USDGBP derived as 1/GBPUSD
+  USDCAD:0, USDCHF:0, NZDUSD:0, EURJPY:0,
 };
 
 // M1 OHLC for miss-hit detection (previous closed candle high/low)
@@ -193,7 +199,8 @@ const INDEX_HOURS_UTC = {
   NIF50:  { days: [1,2,3,4,5], open: 3*60+45,  close: 10*60 },
 };
 
-const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP']);
+const FOREX_PAIRS = new Set(['EURUSD','GBPUSD','USDJPY','GBPJPY','AUDUSD','USDGBP',
+  'USDCAD','USDCHF','NZDUSD','EURJPY']);
 
 function isWeekend() {
   const day = new Date().getUTCDay(); // 0=Sun, 6=Sat
@@ -492,6 +499,48 @@ function startRtdbListener() {
   }
 
   connect();
+}
+
+// ── REST polling fallback for alerts ──────────────────────────────────────────
+// The SSE stream above (startRtdbListener) is the primary, low-latency path.
+// It has proven unreliable in production for reasons still under investigation
+// (connects with 200 but sometimes never delivers the initial data dump).
+// This poller is a safety net: plain REST GET of /alerts.json, proven reliable,
+// runs independently on its own interval and self-heals activeAlerts regardless
+// of whether the SSE stream is working. Slightly higher latency (up to pollMs)
+// but guarantees alerts are never silently stuck at 0.
+async function pollAlertsFallback() {
+  try {
+    const value = await rtdbGet('alerts');
+    const rebuilt = {};
+    if (value && typeof value === 'object') {
+      for (const userId of Object.keys(value)) {
+        const userAlerts = value[userId];
+        if (userAlerts && typeof userAlerts === 'object') {
+          for (const [alertId, alert] of Object.entries(userAlerts)) {
+            if (alert && typeof alert === 'object') {
+              rebuilt[alertId] = { ...alert, userId };
+            }
+          }
+        }
+      }
+    }
+
+    const before = Object.keys(activeAlerts).length;
+    const after  = Object.keys(rebuilt).length;
+
+    // Replace activeAlerts contents in place (keep same object reference,
+    // other code closes over `activeAlerts` directly)
+    Object.keys(activeAlerts).forEach(k => delete activeAlerts[k]);
+    Object.assign(activeAlerts, rebuilt);
+
+    if (before !== after) {
+      log(`Alerts fallback poll: ${after} active alerts (was ${before})`);
+      scheduleGateResubscribe();
+    }
+  } catch (e) {
+    warn(`Alerts fallback poll error: ${e.message}`);
+  }
 }
 
 // Track whether we've done the first full load — reconnects skip the clear
@@ -838,7 +887,9 @@ const GATE_SYMBOLS = {
   XRP:'XRP_USDT', ADA:'ADA_USDT', DOGE:'DOGE_USDT', AVAX:'AVAX_USDT',
   DOT:'DOT_USDT', MATIC:'POL_USDT', LINK:'LINK_USDT', UNI:'UNI_USDT',
   ATOM:'ATOM_USDT', LTC:'LTC_USDT', BCH:'BCH_USDT', NEAR:'NEAR_USDT',
-  ARB:'ARB_USDT', OP:'OP_USDT', SHIB:'SHIB_USDT', TRX:'TRX_USDT'
+  ARB:'ARB_USDT', OP:'OP_USDT', SHIB:'SHIB_USDT', TRX:'TRX_USDT',
+  SUI:'SUI_USDT', APT:'APT_USDT', PEPE:'PEPE_USDT',
+  ICP:'ICP_USDT', INJ:'INJ_USDT', FIL:'FIL_USDT', HBAR:'HBAR_USDT'
 };
 
 const GATE_REVERSE = {};
@@ -852,7 +903,9 @@ const MEXC_SYMBOLS = {
   XRP:'XRPUSDT', ADA:'ADAUSDT', DOGE:'DOGEUSDT', AVAX:'AVAXUSDT',
   DOT:'DOTUSDT', MATIC:'MATICUSDT', LINK:'LINKUSDT', UNI:'UNIUSDT',
   ATOM:'ATOMUSDT', LTC:'LTCUSDT', BCH:'BCHUSDT', NEAR:'NEARUSDT',
-  ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT'
+  ARB:'ARBUSDT', OP:'OPUSDT', SHIB:'SHIBUSDT', TRX:'TRXUSDT',
+  SUI:'SUIUSDT', APT:'APTUSDT', PEPE:'PEPEUSDT',
+  ICP:'ICPUSDT', INJ:'INJUSDT', FIL:'FILUSDT', HBAR:'HBARUSDT'
 };
 
 let gateWs = null;
@@ -1013,7 +1066,8 @@ const YAHOO_SYMBOLS = {
   SPX500: '%5EGSPC', US30: '%5EDJI', US100: '%5ENDX',
   DXY: 'DX-Y.NYB', NIF50: '%5ENSEI',
   EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X',
-  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X'
+  GBPJPY: 'GBPJPY=X', AUDUSD: 'AUDUSD=X',
+  USDCAD: 'USDCAD=X', USDCHF: 'USDCHF=X', NZDUSD: 'NZDUSD=X', EURJPY: 'EURJPY=X'
   // USDGBP is derived from GBPUSD (1/GBPUSD) — not a separate Yahoo fetch
 };
 
@@ -1604,6 +1658,11 @@ async function main() {
 
   startHealthServer();
   startRtdbListener();
+
+  // Safety-net REST poll for alerts — self-heals activeAlerts even if the
+  // SSE stream above fails to deliver data. Runs immediately, then every 15s.
+  pollAlertsFallback();
+  setInterval(pollAlertsFallback, 15000);
 
   // Capital.com WebSocket for metals
   await createCapSession();
