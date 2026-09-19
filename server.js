@@ -342,7 +342,12 @@ async function firestoreGet(path) {
 async function firestorePatch(path, fields) {
   const token    = await getAccessToken();
   const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${path}`;
-  const fieldPaths = Object.keys(fields);
+  // Firestore requires any field-path segment that isn't a plain identifier
+  // ([a-zA-Z_][a-zA-Z_0-9]*) to be wrapped in backticks — e.g. alert ids,
+  // which are UUIDs containing hyphens. Backtick-wrapping a plain identifier
+  // (like "date") is also valid, so this is safe for every key, not just
+  // ones that need it.
+  const fieldPaths = Object.keys(fields).map(k => '`' + k.replace(/[`\\]/g, '\\$&') + '`');
   return fetchJson(
     `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
     {
