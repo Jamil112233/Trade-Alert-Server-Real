@@ -420,11 +420,14 @@ async function logAdminPanelAlertTrigger(alert, hitTimeMs) {
     // Date marker doc — same idempotent pattern the app writes on open/alert
     // creation, so the date is listable even if this is the day's very first
     // admin_panel write (e.g. an alert set yesterday triggering after midnight).
-    await firestorePatch(`admin_panel/${pakistanDate}`, {
+    const markerRes = await firestorePatch(`admin_panel/${pakistanDate}`, {
       date: { stringValue: pakistanDate }
     });
+    if (markerRes?.error) {
+      warn(`  admin_panel date marker error: ${JSON.stringify(markerRes.error)}`);
+    }
 
-    await firestorePatch(`admin_panel/${pakistanDate}/alerts/alerts_trigger`, {
+    const triggerRes = await firestorePatch(`admin_panel/${pakistanDate}/alerts/alerts_trigger`, {
       [alert.id]: {
         mapValue: {
           fields: {
@@ -437,7 +440,11 @@ async function logAdminPanelAlertTrigger(alert, hitTimeMs) {
         }
       }
     });
-    log(`  admin_panel alerts_trigger logged: ${alert.id}`);
+    if (triggerRes?.error) {
+      warn(`  admin_panel alerts_trigger error: ${JSON.stringify(triggerRes.error)}`);
+    } else {
+      log(`  admin_panel alerts_trigger logged: ${alert.id}`);
+    }
   } catch (e) {
     warn(`  admin_panel alerts_trigger failed: ${e.message}`);
   }
