@@ -367,6 +367,82 @@ async function firestoreDelete(path) {
   });
 }
 
+// ── admin_panel stats: Pakistan-time helpers ────────────────────────────────
+// Mirrors the Android app's TimeUtils formatting (dd MMM yyyy / dd MMM yyyy
+// hh:mm:ss a) so admin_panel records written from here line up with the ones
+// written from the app itself. Pakistan Standard Time is fixed UTC+5, no DST.
+const PAKISTAN_TZ = 'Asia/Karachi';
+
+function pakistanTimeParts(ms) {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: PAKISTAN_TZ,
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
+  });
+  const parts = fmt.formatToParts(new Date(ms));
+  const get = (type) => parts.find(p => p.type === type)?.value || '';
+  return {
+    day: get('day'), month: get('month'), year: get('year'),
+    hour: get('hour'), minute: get('minute'), second: get('second'),
+    dayPeriod: get('dayPeriod').toUpperCase()
+  };
+}
+
+/** e.g. "18 Sep 2026" — used as the admin_panel/{date} document id. */
+function formatPakistanDateOnly(ms) {
+  const p = pakistanTimeParts(ms);
+  return `${p.day} ${p.month} ${p.year}`;
+}
+
+/** e.g. "18 Sep 2026 02:15:33 PM" — used as a unique per-event field key/value. */
+function formatPakistanTimeWithSeconds(ms) {
+  const p = pakistanTimeParts(ms);
+  return `${p.day} ${p.month} ${p.year} ${p.hour}:${p.minute}:${p.second} ${p.dayPeriod}`;
+}
+
+/**
+ * Logs a triggered alert into admin_panel/{pakistanDate}/alerts/alerts_trigger
+ * — same shape and same slim field set as the app's own alerts_create record
+ * (userId, pair, targetPrice, candleClose), plus triggerTime instead of
+ * createTime. Keyed by the alert's own id, same as alerts_create.
+ *
+ * Uses firestorePatch() — a merge write via updateMask.fieldPaths — so this
+ * never clobbers other alerts already logged in the same document, and
+ * creates the date-marker/alerts_trigger documents on first write of the day
+ * if they don't exist yet. Never throws — a failure here should never break
+ * the actual trigger flow (RTDB delete / Firestore history / FCM).
+ */
+async function logAdminPanelAlertTrigger(alert, hitTimeMs) {
+  try {
+    const pakistanDate = formatPakistanDateOnly(hitTimeMs);
+    const triggerTime  = formatPakistanTimeWithSeconds(hitTimeMs);
+
+    // Date marker doc — same idempotent pattern the app writes on open/alert
+    // creation, so the date is listable even if this is the day's very first
+    // admin_panel write (e.g. an alert set yesterday triggering after midnight).
+    await firestorePatch(`admin_panel/${pakistanDate}`, {
+      date: { stringValue: pakistanDate }
+    });
+
+    await firestorePatch(`admin_panel/${pakistanDate}/alerts/alerts_trigger`, {
+      [alert.id]: {
+        mapValue: {
+          fields: {
+            userId:      { stringValue: String(alert.userId || '') },
+            pair:        { stringValue: String(alert.pairSymbol || '') },
+            targetPrice: { doubleValue: parseFloat(alert.targetPrice) || 0 },
+            candleClose: { booleanValue: !!alert.candleClose },
+            triggerTime: { stringValue: triggerTime }
+          }
+        }
+      }
+    });
+    log(`  admin_panel alerts_trigger logged: ${alert.id}`);
+  } catch (e) {
+    warn(`  admin_panel alerts_trigger failed: ${e.message}`);
+  }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // SECTION 3 — RTDB ALERT LISTENER
 // ════════════════════════════════════════════════════════════════════════════
@@ -1516,6 +1592,10 @@ async function processTriggeredAlert(alert, hitPrice) {
     if (res3?.error) warn(`  Firestore history write error: ${JSON.stringify(res3.error)}`);
     else log(`  Firestore history written: ${alertId}`);
   } catch(e) { warn(`  Firestore history write failed: ${e.message}`); }
+
+  // 3.5. Mirror into admin_panel for stats monitoring (slim record — not the
+  // full alert). Never throws, so this can't break the rest of the trigger flow.
+  await logAdminPanelAlertTrigger(alert, hitTime);
 
   // 4. (history_index removed — app reads history doc directly on login)
 
