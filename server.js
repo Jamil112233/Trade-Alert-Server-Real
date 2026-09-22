@@ -330,6 +330,30 @@ async function rtdbDelete(path) {
   return fetchJson(url, { method: 'DELETE' });
 }
 
+// Pakistan-time formatting — must byte-match TimeUtils.formatPakistanDateOnly()
+// / formatPakistanTimeWithSeconds() in the Android app (3-letter months, not
+// Intl's 4-letter "Sept"), since the admin panel groups everything by this
+// exact date-string doc ID.
+const PK_MONTHS_3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function pkDateOnly(ms) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Karachi', day: '2-digit', month: 'numeric', year: 'numeric',
+  }).formatToParts(new Date(ms));
+  const get = (t) => parts.find((p) => p.type === t).value;
+  const monthIdx = parseInt(get('month'), 10) - 1;
+  return `${get('day')} ${PK_MONTHS_3[monthIdx]} ${get('year')}`;
+}
+function pkTimeFull(ms) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Karachi', day: '2-digit', month: 'numeric', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+  }).formatToParts(new Date(ms));
+  const get = (t) => parts.find((p) => p.type === t).value;
+  const monthIdx = parseInt(get('month'), 10) - 1;
+  const ampm = (parts.find((p) => p.type === 'dayPeriod')?.value || '').toUpperCase();
+  return `${get('day')} ${PK_MONTHS_3[monthIdx]} ${get('year')} ${get('hour')}:${get('minute')}:${get('second')} ${ampm}`;
+}
+
 // Firestore REST helper
 async function firestoreGet(path) {
   const token = await getAccessToken();
@@ -1516,6 +1540,44 @@ async function processTriggeredAlert(alert, hitPrice) {
     if (res3?.error) warn(`  Firestore history write error: ${JSON.stringify(res3.error)}`);
     else log(`  Firestore history written: ${alertId}`);
   } catch(e) { warn(`  Firestore history write failed: ${e.message}`); }
+
+  // 3b. Log the trigger into the admin panel's daily tree — same date-doc
+  // convention as the app's own admin_panel writes (Pakistan calendar day),
+  // so the dashboard's "Alerts Triggered Today" count and per-user activity
+  // popup pick this up automatically. admin_panel records are native
+  // Firestore maps (the app writes them via a plain Map<String,Object> with
+  // SetOptions.merge()) — NOT the JSON-string-per-field convention used by
+  // active_alerts/history, so this needs typed Firestore field values.
+  try {
+    const token   = await getAccessToken();
+    const dateDoc = pkDateOnly(hitTime);
+    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin_panel/${dateDoc}/alerts/alerts_trigger`;
+    const triggerMapFields = {
+      userId:      { stringValue: String(alert.userId || userId || '') },
+      pair:        { stringValue: String(alert.pairSymbol || alert.pair || '') },
+      targetPrice: { doubleValue: Number(alert.targetPrice) || 0 },
+      candleClose: { booleanValue: !!alert.candleClose },
+      triggerTime: { stringValue: pkTimeFull(hitTime) },
+    };
+    const res4 = await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body:    JSON.stringify({
+          writes: [{
+            update: {
+              name:   docPath,
+              fields: { [alertId]: { mapValue: { fields: triggerMapFields } } }
+            },
+            updateMask: { fieldPaths: ['`' + alertId + '`'] }
+          }]
+        })
+      }
+    );
+    if (res4?.error) warn(`  Firestore admin_panel trigger-log write error: ${JSON.stringify(res4.error)}`);
+    else log(`  Firestore admin_panel trigger-log written: ${alertId}`);
+  } catch(e) { warn(`  Firestore admin_panel trigger-log write failed: ${e.message}`); }
 
   // 4. (history_index removed — app reads history doc directly on login)
 
