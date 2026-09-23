@@ -1687,6 +1687,37 @@ function startHealthServer() {
       return;
     }
 
+    // Full per-alert list, for the admin panel's Active Alerts browser page.
+    // Same auth as /admin/active-alerts above; also free — this data is
+    // already sitting in memory, this just serializes the fields the admin
+    // panel actually needs (skips internal-only fields like sound/vibration
+    // flags, alarm type, etc — those aren't shown there).
+    if (req.url === '/admin/active-alerts-list') {
+      const secret = req.headers['x-admin-secret'];
+      if (!process.env.ADMIN_PANEL_SECRET || secret !== process.env.ADMIN_PANEL_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+      const list = Object.entries(activeAlerts).map(([alertId, a]) => ({
+        alertId,
+        userId:      a.userId || '',
+        userEmail:   a.userEmail || '',
+        pairSymbol:  a.pairSymbol || '',
+        pairName:    a.pairName || '',
+        pairEmoji:   a.pairEmoji || '',
+        targetPrice: a.targetPrice,
+        direction:   a.direction || '',
+        candleClose: !!a.candleClose,
+        timeframe:   a.timeframe || '',
+        label:       a.label || '',
+        createdAt:   a.createdAt || 0,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ total: list.length, alerts: list, updatedAt: Date.now() }));
+      return;
+    }
+
     // Dedicated, secret-gated endpoint for the admin panel Worker — separate
     // from the public "/" health check below, which stays unauthenticated
     // on purpose for uptime monitors. Costs nothing extra: activeAlerts is
