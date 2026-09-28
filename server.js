@@ -533,6 +533,20 @@ function startRtdbListener() {
 // runs independently on its own interval and self-heals activeAlerts regardless
 // of whether the SSE stream is working. Slightly higher latency (up to pollMs)
 // but guarantees alerts are never silently stuck at 0.
+// Keep in-memory-only state when a cached alert object is replaced by a fresh copy from
+// RTDB (hourly fallback poll, alert updates): the side tracker for repeating alerts and the
+// newest lastTriggeredAt. Side tracker is dropped if the target price was edited.
+function carryRuntimeState(oldAlert, newAlert) {
+  if (!oldAlert || !newAlert) return newAlert;
+  if (oldAlert._lastSide && parseFloat(oldAlert.targetPrice) === parseFloat(newAlert.targetPrice)) {
+    newAlert._lastSide = oldAlert._lastSide;
+  }
+  if ((oldAlert.lastTriggeredAt || 0) > (newAlert.lastTriggeredAt || 0)) {
+    newAlert.lastTriggeredAt = oldAlert.lastTriggeredAt;
+  }
+  return newAlert;
+}
+
 async function pollAlertsFallback() {
   try {
     const value = await rtdbGet('alerts');
@@ -543,7 +557,7 @@ async function pollAlertsFallback() {
         if (userAlerts && typeof userAlerts === 'object') {
           for (const [alertId, alert] of Object.entries(userAlerts)) {
             if (alert && typeof alert === 'object') {
-              rebuilt[alertId] = { ...alert, userId };
+              rebuilt[alertId] = carryRuntimeState(activeAlerts[alertId], { ...alert, userId });
             }
           }
         }
@@ -662,7 +676,7 @@ function handleRtdbEvent(event, data) {
         scheduleGateResubscribe();
       } else {
         // Alert added or updated
-        activeAlerts[alertId] = { ...value, userId };
+        activeAlerts[alertId] = carryRuntimeState(activeAlerts[alertId], { ...value, userId });
         log(`RTDB alert added: ${alertId} (${value.pairSymbol} ${value.direction} ${value.targetPrice})`);
         scheduleGateResubscribe();
       }
@@ -1267,9 +1281,9 @@ function checkAlerts() {
 //
 // We track, per alert, which side of the target the price was on at the last
 // check (alert._lastSide). A crossing = the side flipped since last check.
-// The very first check for an alert only establishes the baseline side (no
-// trigger) — this avoids a false trigger the instant an alert is created on
-// whichever side of the target the price already happens to be.
+// The baseline side is the side the price was on when the alert was created
+// (or the side persisted at the last trigger), so a candle close that is already
+// across the target on the very first check correctly triggers.
 // ════════════════════════════════════════════════════════════════════════════
 
 function checkRepeatingCrossing(alert, value) {
@@ -1277,9 +1291,15 @@ function checkRepeatingCrossing(alert, value) {
   if (!target) return;
   const currentSide = value >= target ? 'above' : 'below';
 
+  // First evaluation of this alert in this process: baseline = the side the price was
+  // on when the alert was CREATED (alert.direction is "above" when the target sat above
+  // the creation price, i.e. creation side = "below"), or the side persisted at the last
+  // trigger. Using the creation side (not "whatever the first check sees") means the very
+  // first candle close / tick that is already across the target counts as a crossing.
   if (alert._lastSide == null) {
-    alert._lastSide = currentSide; // establish baseline, no trigger on first look
-    return;
+    alert._lastSide = (alert.lastSide === 'above' || alert.lastSide === 'below')
+      ? alert.lastSide
+      : (alert.direction === 'above' ? 'below' : 'above');
   }
   if (alert._lastSide === currentSide) return; // no crossing since last check
 
@@ -1659,15 +1679,21 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
   const alertId    = alert.id;
   const userId     = alert.userId;
   const hitTime    = Date.now();
+  // Admin-panel log gets a unique key per firing (every trigger is an event);
+  // history uses ONE stable key per repeating alert so there is a single history
+  // card that just gets its hit time bumped on every firing.
   const historyKey = `${alertId}_${hitTime}`;
+  const historyId  = `${alertId}_rep`;
 
   // Update in-memory cache immediately — this IS the cached object (by
   // reference), so the cooldown is enforced for every check tick from here on.
   alert.lastTriggeredAt = hitTime;
+  alert.lastSide        = crossSide; // persisted so a restart/reload keeps the right baseline
 
   // 1. RTDB — patch just lastTriggeredAt on the live alert node (alert stays active)
   try {
     await rtdbSet(`alerts/${userId}/${alertId}/lastTriggeredAt`, hitTime);
+    await rtdbSet(`alerts/${userId}/${alertId}/lastSide`, crossSide);
     log(`  RTDB lastTriggeredAt updated (repeating): ${alertId}`);
   } catch(e) { warn(`  RTDB lastTriggeredAt update failed: ${e.message}`); }
 
@@ -1675,14 +1701,16 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
   // JSON blob for this alert (it's one JSON string per field, not sub-fields,
   // so this needs a read-modify-write of just that field).
   try {
-    await updateActiveAlertFirestoreField(userId, alertId, { lastTriggeredAt: hitTime });
+    await updateActiveAlertFirestoreField(userId, alertId, { lastTriggeredAt: hitTime, lastSide: crossSide });
   } catch(e) { warn(`  Firestore active_alerts repeating update failed: ${e.message}`); }
 
   // 3. Firestore history — a NEW entry per firing (unique key), original alert
   // is untouched and stays in active_alerts.
   try {
     const token    = await getAccessToken();
-    const hitAlert = { ...alert, direction: crossSide, triggered: true, hitAt: hitTime, active: false };
+    // id MUST differ from the live alert's id — the app builds its history list
+    // from this JSON's "id", and reusing the live id would collide with the active alert on sync.
+    const hitAlert = { ...alert, id: historyId, direction: crossSide, triggered: true, hitAt: hitTime, active: false };
     delete hitAlert._lastSide;
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
     const res3 = await fetchJson(
@@ -1692,14 +1720,14 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
         headers: { 'Authorization': `Bearer ${token}` },
         body:    JSON.stringify({
           writes: [{
-            update: { name: docPath, fields: { [historyKey]: { stringValue: JSON.stringify(hitAlert) } } },
-            updateMask: { fieldPaths: ['`' + historyKey + '`'] }
+            update: { name: docPath, fields: { [historyId]: { stringValue: JSON.stringify(hitAlert) } } },
+            updateMask: { fieldPaths: ['`' + historyId + '`'] }
           }]
         })
       }
     );
     if (res3?.error) warn(`  Firestore repeating history write error: ${JSON.stringify(res3.error)}`);
-    else log(`  Firestore repeating history written: ${historyKey}`);
+    else log(`  Firestore repeating history updated: ${historyId}`);
   } catch(e) { warn(`  Firestore repeating history write failed: ${e.message}`); }
 
   // 3b. Admin panel trigger log — same date-doc convention as the once-mode path
@@ -1713,6 +1741,7 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
       targetPrice: { doubleValue: Number(alert.targetPrice) || 0 },
       candleClose: { booleanValue: !!alert.candleClose },
       repeating:   { booleanValue: true },
+      cooldownMinutes: { integerValue: String(parseInt(alert.cooldownMinutes, 10) || 5) },
       triggerTime: { stringValue: pkTimeFull(hitTime) },
     };
     const res4 = await fetchJson(
@@ -1758,7 +1787,7 @@ async function updateActiveAlertFirestoreField(userId, alertId, updates) {
   Object.assign(obj, updates);
 
   const writeRes = await fetchJson(
-    `${docUrl}?updateMask.fieldPaths=${encodeURIComponent(alertId)}`,
+    `${docUrl}?updateMask.fieldPaths=${encodeURIComponent('`' + alertId + '`')}`,
     {
       method:  'PATCH',
       headers: authHdr,
