@@ -1297,9 +1297,17 @@ function checkRepeatingCrossing(alert, value) {
   // trigger. Using the creation side (not "whatever the first check sees") means the very
   // first candle close / tick that is already across the target counts as a crossing.
   if (alert._lastSide == null) {
-    alert._lastSide = (alert.lastSide === 'above' || alert.lastSide === 'below')
-      ? alert.lastSide
-      : (alert.direction === 'above' ? 'below' : 'above');
+    if (alert.lastSide === 'above' || alert.lastSide === 'below') {
+      alert._lastSide = alert.lastSide;               // persisted at the last trigger
+    } else if ((alert.lastTriggeredAt || 0) > 0) {
+      // Already fired before, but its side was never persisted (fired on an older server
+      // version) — the creation side would be wrong now. Learn the side from the current
+      // value and wait for the NEXT real crossing instead of firing a false alert.
+      alert._lastSide = currentSide;
+      return;
+    } else {
+      alert._lastSide = (alert.direction === 'above' ? 'below' : 'above'); // creation side
+    }
   }
   if (alert._lastSide === currentSide) return; // no crossing since last check
 
