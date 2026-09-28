@@ -1219,7 +1219,8 @@ function checkAlerts() {
   const nowMs = Date.now();
   for (const alert of alertList) {
     try {
-      if (recentlyTriggered.has(alert.id)) continue;
+      const mode = alert.alertMode === 'repeating' ? 'repeating' : 'once';
+      if (mode === 'once' && recentlyTriggered.has(alert.id)) continue;
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
       if (alert.candleClose) continue; // handled by checkCandleCloseAlerts at minute boundary
 
@@ -1235,6 +1236,11 @@ function checkAlerts() {
       const target = parseFloat(alert.targetPrice);
       if (!target) continue;
 
+      if (mode === 'repeating') {
+        checkRepeatingCrossing(alert, price);
+        continue;
+      }
+
       let hit = false;
       if (alert.direction === 'above' && price >= target) hit = true;
       if (alert.direction === 'below' && price <= target) hit = true;
@@ -1249,6 +1255,51 @@ function checkAlerts() {
       }
     } catch(e) { warn(`checkAlerts error for ${alert.id}: ${e.message}`); }
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REPEATING ALERTS — crossing detection + cooldown
+//
+// Unlike "once" alerts (fixed direction, delete on hit), a repeating alert
+// fires every time the price CROSSES the target line — in either direction —
+// subject to a per-alert cooldown so a price flickering around the target
+// doesn't spam FCMs.
+//
+// We track, per alert, which side of the target the price was on at the last
+// check (alert._lastSide). A crossing = the side flipped since last check.
+// The very first check for an alert only establishes the baseline side (no
+// trigger) — this avoids a false trigger the instant an alert is created on
+// whichever side of the target the price already happens to be.
+// ════════════════════════════════════════════════════════════════════════════
+
+function checkRepeatingCrossing(alert, value) {
+  const target = parseFloat(alert.targetPrice);
+  if (!target) return;
+  const currentSide = value >= target ? 'above' : 'below';
+
+  if (alert._lastSide == null) {
+    alert._lastSide = currentSide; // establish baseline, no trigger on first look
+    return;
+  }
+  if (alert._lastSide === currentSide) return; // no crossing since last check
+
+  const crossSide = currentSide;
+  alert._lastSide = currentSide; // update immediately — avoids re-detecting the same crossing
+
+  const cooldownMs = Math.max(1, parseInt(alert.cooldownMinutes, 10) || 5) * 60000;
+  const lastFired   = alert.lastTriggeredAt || 0;
+  const now         = Date.now();
+
+  if (now - lastFired < cooldownMs) {
+    const secsLeft = Math.ceil((cooldownMs - (now - lastFired)) / 1000);
+    log(`  🔁 repeating alert ${alert.id} crossed target (${crossSide}) but in cooldown — ${secsLeft}s left`);
+    return;
+  }
+
+  log(`🎯🔁 Repeating alert triggered: ${alert.pairSymbol} crossed ${target} (${crossSide}, value=${value}) user=${alert.userId}`);
+  processRepeatingTrigger(alert, value, crossSide).catch(e => {
+    err(`processRepeatingTrigger error: ${e.message}`);
+  });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1387,7 +1438,8 @@ function checkCandleCloseAlerts(closedTfs) {
   const nowMs = Date.now();
   for (const alert of alertList) {
     try {
-      if (recentlyTriggered.has(alert.id)) {
+      const mode = alert.alertMode === 'repeating' ? 'repeating' : 'once';
+      if (mode === 'once' && recentlyTriggered.has(alert.id)) {
         log(`    SKIP ${alert.id}: recentlyTriggered`); continue;
       }
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
@@ -1399,10 +1451,16 @@ function checkCandleCloseAlerts(closedTfs) {
       if (FOREX_PAIRS.has(sym) && !isForexOpen()) continue;
 
       const close = getCandleClose(alert.pairSymbol, alert.timeframe);
-      log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction}`);
+      log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction} mode=${mode}`);
       if (!close || close <= 0) continue;
 
       const target = parseFloat(alert.targetPrice);
+
+      if (mode === 'repeating') {
+        checkRepeatingCrossing(alert, close);
+        continue;
+      }
+
       let hit = false;
       if (alert.direction === 'above' && close >= target) hit = true;
       if (alert.direction === 'below' && close <= target) hit = true;
@@ -1587,6 +1645,130 @@ async function processTriggeredAlert(alert, hitPrice) {
   } catch(e) { warn(`  FCM failed: ${e.message}`); }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 10b — REPEATING ALERT TRIGGER PROCESSING
+//
+// Differs from processTriggeredAlert() in the important way: the alert is
+// NEVER deleted from RTDB/Firestore active_alerts — it keeps monitoring.
+// Each firing instead gets its own uniquely-keyed history entry
+// ("<alertId>_<hitTime>"), and lastTriggeredAt is bumped everywhere (memory,
+// RTDB, Firestore) so the cooldown survives a server restart.
+// ════════════════════════════════════════════════════════════════════════════
+
+async function processRepeatingTrigger(alert, hitPrice, crossSide) {
+  const alertId    = alert.id;
+  const userId     = alert.userId;
+  const hitTime    = Date.now();
+  const historyKey = `${alertId}_${hitTime}`;
+
+  // Update in-memory cache immediately — this IS the cached object (by
+  // reference), so the cooldown is enforced for every check tick from here on.
+  alert.lastTriggeredAt = hitTime;
+
+  // 1. RTDB — patch just lastTriggeredAt on the live alert node (alert stays active)
+  try {
+    await rtdbSet(`alerts/${userId}/${alertId}/lastTriggeredAt`, hitTime);
+    log(`  RTDB lastTriggeredAt updated (repeating): ${alertId}`);
+  } catch(e) { warn(`  RTDB lastTriggeredAt update failed: ${e.message}`); }
+
+  // 2. Firestore active_alerts field — merge lastTriggeredAt into the stored
+  // JSON blob for this alert (it's one JSON string per field, not sub-fields,
+  // so this needs a read-modify-write of just that field).
+  try {
+    await updateActiveAlertFirestoreField(userId, alertId, { lastTriggeredAt: hitTime });
+  } catch(e) { warn(`  Firestore active_alerts repeating update failed: ${e.message}`); }
+
+  // 3. Firestore history — a NEW entry per firing (unique key), original alert
+  // is untouched and stays in active_alerts.
+  try {
+    const token    = await getAccessToken();
+    const hitAlert = { ...alert, direction: crossSide, triggered: true, hitAt: hitTime, active: false };
+    delete hitAlert._lastSide;
+    const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
+    const res3 = await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body:    JSON.stringify({
+          writes: [{
+            update: { name: docPath, fields: { [historyKey]: { stringValue: JSON.stringify(hitAlert) } } },
+            updateMask: { fieldPaths: ['`' + historyKey + '`'] }
+          }]
+        })
+      }
+    );
+    if (res3?.error) warn(`  Firestore repeating history write error: ${JSON.stringify(res3.error)}`);
+    else log(`  Firestore repeating history written: ${historyKey}`);
+  } catch(e) { warn(`  Firestore repeating history write failed: ${e.message}`); }
+
+  // 3b. Admin panel trigger log — same date-doc convention as the once-mode path
+  try {
+    const token   = await getAccessToken();
+    const dateDoc = pkDateOnly(hitTime);
+    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin_panel/${dateDoc}/alerts/alerts_trigger`;
+    const triggerMapFields = {
+      userId:      { stringValue: String(alert.userId || userId || '') },
+      pair:        { stringValue: String(alert.pairSymbol || '') },
+      targetPrice: { doubleValue: Number(alert.targetPrice) || 0 },
+      candleClose: { booleanValue: !!alert.candleClose },
+      repeating:   { booleanValue: true },
+      triggerTime: { stringValue: pkTimeFull(hitTime) },
+    };
+    const res4 = await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body:    JSON.stringify({
+          writes: [{
+            update: { name: docPath, fields: { [historyKey]: { mapValue: { fields: triggerMapFields } } } },
+            updateMask: { fieldPaths: ['`' + historyKey + '`'] }
+          }]
+        })
+      }
+    );
+    if (res4?.error) warn(`  Firestore admin_panel repeating trigger-log write error: ${JSON.stringify(res4.error)}`);
+  } catch(e) { warn(`  Firestore admin_panel repeating trigger-log write failed: ${e.message}`); }
+
+  // 4. Send FCM — pass the actual crossing direction so the notification shows
+  // the correct 📈/📉 label for THIS firing (alert.direction stays fixed from
+  // creation and isn't meaningful for a repeating alert).
+  try {
+    await sendFCM(userId, { ...alert, direction: crossSide }, hitPrice);
+  } catch(e) { warn(`  FCM failed: ${e.message}`); }
+}
+
+/**
+ * Read-modify-write a single field of the active_alerts/alerts doc, merging
+ * `updates` into the JSON object stored in that field's stringValue (the doc
+ * stores one JSON-string field per alert, not native Firestore sub-fields).
+ */
+async function updateActiveAlertFirestoreField(userId, alertId, updates) {
+  const token   = await getAccessToken();
+  const docUrl  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
+  const authHdr = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+
+  const readRes = await fetchJson(docUrl, { headers: authHdr });
+  const raw = readRes?.fields?.[alertId]?.stringValue;
+  if (!raw) { warn(`  updateActiveAlertFirestoreField: field missing for ${alertId}`); return; }
+
+  let obj;
+  try { obj = JSON.parse(raw); } catch(e) { warn(`  updateActiveAlertFirestoreField parse failed: ${e.message}`); return; }
+  Object.assign(obj, updates);
+
+  const writeRes = await fetchJson(
+    `${docUrl}?updateMask.fieldPaths=${encodeURIComponent(alertId)}`,
+    {
+      method:  'PATCH',
+      headers: authHdr,
+      body:    JSON.stringify({ fields: { [alertId]: { stringValue: JSON.stringify(obj) } } })
+    }
+  );
+  if (writeRes?.error) warn(`  updateActiveAlertFirestoreField write error: ${JSON.stringify(writeRes.error)}`);
+  else log(`  Firestore active_alerts field updated (repeating): ${alertId}`);
+}
+
 
 
 async function sendFCM(userId, alert, hitPrice) {
@@ -1620,6 +1802,8 @@ async function sendFCM(userId, alert, hitPrice) {
         hitTime:      String(Date.now()),
         isVibration:    String(alert.vibrationEnabled !== false),
         isSoundEnabled: String(alert.soundEnabled !== false),
+        alertMode:       alert.alertMode === 'repeating' ? 'repeating' : 'once',
+        cooldownMinutes: String(alert.cooldownMinutes || 5),
       },
       // notification field intentionally omitted for ALL message types.
       // Sending a notification field causes Android to show a system-generated
