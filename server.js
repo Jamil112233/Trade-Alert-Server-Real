@@ -330,6 +330,36 @@ async function rtdbDelete(path) {
   return fetchJson(url, { method: 'DELETE' });
 }
 
+// PATCH updates only the given children of `path`, leaving sibling fields on
+// that node untouched (unlike PUT, which replaces the whole node).
+async function rtdbPatch(path, data) {
+  const url = `${FIREBASE_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
+  return fetchJson(url, { method: 'PATCH', body: JSON.stringify(data) });
+}
+
+// ── Bulletproof write helper for the trigger-processing pipeline ───────────
+// attemptFn does a write AND reads the value back from the server to confirm
+// it actually landed (not just that the HTTP call didn't throw) — same idea
+// as the app's verifyBothLocationsOnServer() for alert creation. Retries the
+// whole write+verify cycle a couple of times before giving up.
+async function withVerifiedRetry(label, attemptFn, retries = 2, delayMs = 1200) {
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      const ok = await attemptFn();
+      if (ok) {
+        if (attempt > 1) log(`  ✅ ${label} confirmed on retry ${attempt}`);
+        return true;
+      }
+      warn(`  ${label}: verify mismatch on attempt ${attempt}/${retries + 1}`);
+    } catch (e) {
+      warn(`  ${label}: attempt ${attempt}/${retries + 1} threw — ${e.message}`);
+    }
+    if (attempt <= retries) await new Promise(r => setTimeout(r, delayMs));
+  }
+  err(`  ❌ ${label} FAILED after ${retries + 1} attempts — giving up`);
+  return false;
+}
+
 // Pakistan-time formatting — must byte-match TimeUtils.formatPakistanDateOnly()
 // / formatPakistanTimeWithSeconds() in the Android app (3-letter months, not
 // Intl's 4-letter "Sept"), since the admin panel groups everything by this
@@ -1687,99 +1717,132 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
   const alertId    = alert.id;
   const userId     = alert.userId;
   const hitTime    = Date.now();
-  // Admin-panel log gets a unique key per firing (every trigger is an event);
-  // history uses ONE stable key per repeating alert so there is a single history
-  // card that just gets its hit time bumped on every firing.
-  const historyKey = `${alertId}_${hitTime}`;
-  const historyId  = `${alertId}_rep`;
+  const newCount   = (parseInt(alert.triggeredCount, 10) || 0) + 1;
+  const historyId  = `${alertId}_rep`; // ONE stable history card per repeating alert
 
   // Update in-memory cache immediately — this IS the cached object (by
-  // reference), so the cooldown is enforced for every check tick from here on.
+  // reference), so cooldown + count are correct for every check tick from here.
   alert.lastTriggeredAt = hitTime;
-  alert.lastSide        = crossSide; // persisted so a restart/reload keeps the right baseline
+  alert.lastSide        = crossSide;
+  alert.triggeredCount  = newCount;
 
-  // 1. RTDB — patch just lastTriggeredAt on the live alert node (alert stays active)
-  try {
-    await rtdbSet(`alerts/${userId}/${alertId}/lastTriggeredAt`, hitTime);
-    await rtdbSet(`alerts/${userId}/${alertId}/lastSide`, crossSide);
-    log(`  RTDB lastTriggeredAt updated (repeating): ${alertId}`);
-  } catch(e) { warn(`  RTDB lastTriggeredAt update failed: ${e.message}`); }
+  // 1. RTDB — a single PATCH covering all 3 fields (PATCH only touches the
+  // given children, unlike PUT which would wipe the rest of the alert node),
+  // then a read-back to confirm the values actually landed on the server.
+  const rtdbOk = await withVerifiedRetry(`RTDB update (${alertId})`, async () => {
+    await rtdbPatch(`alerts/${userId}/${alertId}`, {
+      lastTriggeredAt: hitTime, lastSide: crossSide, triggeredCount: newCount
+    });
+    const check = await rtdbGet(`alerts/${userId}/${alertId}`);
+    return !!check && check.lastTriggeredAt === hitTime && check.triggeredCount === newCount;
+  });
+  if (rtdbOk) log(`  RTDB confirmed (repeating): ${alertId} ×${newCount}`);
 
-  // 2. Firestore active_alerts field — merge lastTriggeredAt into the stored
-  // JSON blob for this alert (it's one JSON string per field, not sub-fields,
-  // so this needs a read-modify-write of just that field).
-  try {
-    await updateActiveAlertFirestoreField(userId, alertId, { lastTriggeredAt: hitTime, lastSide: crossSide });
-  } catch(e) { warn(`  Firestore active_alerts repeating update failed: ${e.message}`); }
+  // 2. Firestore active_alerts field — merge into the stored JSON, confirmed
+  // by a read-back inside updateActiveAlertFirestoreField itself.
+  const fsActiveOk = await withVerifiedRetry(`Firestore active_alerts update (${alertId})`,
+    () => updateActiveAlertFirestoreField(userId, alertId,
+        { lastTriggeredAt: hitTime, lastSide: crossSide, triggeredCount: newCount }));
 
-  // 3. Firestore history — a NEW entry per firing (unique key), original alert
-  // is untouched and stays in active_alerts.
-  try {
+  // 3. Firestore history — ONE stable card per repeating alert. Every firing
+  // REPLACES this same field (new hit time + count) instead of adding a new
+  // one, so the card just jumps back to the top of History on each trigger.
+  const fsHistoryOk = await withVerifiedRetry(`Firestore history update (${historyId})`, async () => {
     const token    = await getAccessToken();
-    // id MUST differ from the live alert's id — the app builds its history list
-    // from this JSON's "id", and reusing the live id would collide with the active alert on sync.
-    const hitAlert = { ...alert, id: historyId, direction: crossSide, triggered: true, hitAt: hitTime, active: false };
+    // id deliberately differs from the live alert's id — the app keys its
+    // history list off this "id" field, and reusing the live id would
+    // collide with the active alert when the app syncs.
+    const hitAlert = { ...alert, id: historyId, direction: crossSide, triggered: true,
+                        hitAt: hitTime, active: false, triggeredCount: newCount };
     delete hitAlert._lastSide;
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
-    const res3 = await fetchJson(
-      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
-      {
-        method:  'POST',
-        headers: { 'Authorization': `Bearer ${token}` },
-        body:    JSON.stringify({
-          writes: [{
-            update: { name: docPath, fields: { [historyId]: { stringValue: JSON.stringify(hitAlert) } } },
-            updateMask: { fieldPaths: ['`' + historyId + '`'] }
-          }]
-        })
-      }
-    );
-    if (res3?.error) warn(`  Firestore repeating history write error: ${JSON.stringify(res3.error)}`);
-    else log(`  Firestore repeating history updated: ${historyId}`);
-  } catch(e) { warn(`  Firestore repeating history write failed: ${e.message}`); }
+    const commitUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`;
+    const authHdr   = { 'Authorization': `Bearer ${token}` };
 
-  // 3b. Admin panel trigger log — same date-doc convention as the once-mode path
-  try {
-    const token   = await getAccessToken();
-    const dateDoc = pkDateOnly(hitTime);
-    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin_panel/${dateDoc}/alerts/alerts_trigger`;
+    const writeRes = await fetchJson(commitUrl, {
+      method:  'POST',
+      headers: authHdr,
+      body:    JSON.stringify({
+        writes: [{
+          update: { name: docPath, fields: { [historyId]: { stringValue: JSON.stringify(hitAlert) } } },
+          updateMask: { fieldPaths: ['`' + historyId + '`'] }
+        }]
+      })
+    });
+    if (writeRes?.error) { warn(`  Firestore history write error: ${JSON.stringify(writeRes.error)}`); return false; }
+
+    // Read back to confirm — not just that Firestore accepted the commit,
+    // but that THIS hit's time + count are what's actually stored now.
+    const readUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
+    const readRes = await fetchJson(readUrl, { headers: authHdr });
+    const raw = readRes?.fields?.[historyId]?.stringValue;
+    if (!raw) return false;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed.hitAt === hitTime && parsed.triggeredCount === newCount;
+    } catch { return false; }
+  });
+  if (fsHistoryOk) log(`  Firestore history confirmed: ${historyId} ×${newCount}`);
+
+  // 3b. Admin panel trigger log — unique key per firing (every trigger is its
+  // own event for the admin stats), best-effort with one retry.
+  await withVerifiedRetry(`Admin panel trigger log (${alertId})`, async () => {
+    const token    = await getAccessToken();
+    const dateDoc  = pkDateOnly(hitTime);
+    const key      = `${alertId}_${hitTime}`;
+    const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin_panel/${dateDoc}/alerts/alerts_trigger`;
     const triggerMapFields = {
-      userId:      { stringValue: String(alert.userId || userId || '') },
-      pair:        { stringValue: String(alert.pairSymbol || '') },
-      targetPrice: { doubleValue: Number(alert.targetPrice) || 0 },
-      candleClose: { booleanValue: !!alert.candleClose },
-      repeating:   { booleanValue: true },
+      userId:          { stringValue: String(alert.userId || userId || '') },
+      pair:            { stringValue: String(alert.pairSymbol || '') },
+      targetPrice:     { doubleValue: Number(alert.targetPrice) || 0 },
+      candleClose:     { booleanValue: !!alert.candleClose },
+      repeating:       { booleanValue: true },
+      triggeredCount:  { integerValue: String(newCount) },
       cooldownMinutes: { integerValue: String(parseInt(alert.cooldownMinutes, 10) || 5) },
-      triggerTime: { stringValue: pkTimeFull(hitTime) },
+      triggerTime:     { stringValue: pkTimeFull(hitTime) },
     };
-    const res4 = await fetchJson(
+    const res = await fetchJson(
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
       {
         method:  'POST',
         headers: { 'Authorization': `Bearer ${token}` },
         body:    JSON.stringify({
           writes: [{
-            update: { name: docPath, fields: { [historyKey]: { mapValue: { fields: triggerMapFields } } } },
-            updateMask: { fieldPaths: ['`' + historyKey + '`'] }
+            update: { name: docPath, fields: { [key]: { mapValue: { fields: triggerMapFields } } } },
+            updateMask: { fieldPaths: ['`' + key + '`'] }
           }]
         })
       }
     );
-    if (res4?.error) warn(`  Firestore admin_panel repeating trigger-log write error: ${JSON.stringify(res4.error)}`);
-  } catch(e) { warn(`  Firestore admin_panel repeating trigger-log write failed: ${e.message}`); }
+    return !res?.error;
+  }, 1);
 
-  // 4. Send FCM — pass the actual crossing direction so the notification shows
-  // the correct 📈/📉 label for THIS firing (alert.direction stays fixed from
-  // creation and isn't meaningful for a repeating alert).
-  try {
-    await sendFCM(userId, { ...alert, direction: crossSide }, hitPrice);
-  } catch(e) { warn(`  FCM failed: ${e.message}`); }
+  // 4. Send FCM — pass the actual crossing direction + running count so the
+  // notification/local history show the right thing for THIS firing.
+  // Retrying is safe: the app's duplicate-guard compares hitTime against the
+  // last hit it already recorded, so a resent copy of the same hitTime is a
+  // no-op on the client even if the first one actually did arrive.
+  const fcmOk = await withVerifiedRetry(`FCM send (${alertId})`, async () => {
+    try {
+      await sendFCM(userId, { ...alert, direction: crossSide, triggeredCount: newCount }, hitPrice);
+      return true;
+    } catch (e) { warn(`  sendFCM threw: ${e.message}`); return false; }
+  }, 2);
+
+  if (!rtdbOk || !fsActiveOk || !fsHistoryOk || !fcmOk) {
+    err(`⚠️  Repeating trigger for ${alertId} completed WITH FAILURES — `
+      + `rtdb=${rtdbOk} fsActive=${fsActiveOk} fsHistory=${fsHistoryOk} fcm=${fcmOk}`);
+  } else {
+    log(`✅ Repeating trigger for ${alertId} fully confirmed (×${newCount})`);
+  }
 }
 
 /**
  * Read-modify-write a single field of the active_alerts/alerts doc, merging
  * `updates` into the JSON object stored in that field's stringValue (the doc
- * stores one JSON-string field per alert, not native Firestore sub-fields).
+ * stores one JSON-string field per alert, not native Firestore sub-fields),
+ * then reads the field back to confirm the merged values actually landed.
+ * Returns true only once that confirmation succeeds.
  */
 async function updateActiveAlertFirestoreField(userId, alertId, updates) {
   const token   = await getAccessToken();
@@ -1788,10 +1851,10 @@ async function updateActiveAlertFirestoreField(userId, alertId, updates) {
 
   const readRes = await fetchJson(docUrl, { headers: authHdr });
   const raw = readRes?.fields?.[alertId]?.stringValue;
-  if (!raw) { warn(`  updateActiveAlertFirestoreField: field missing for ${alertId}`); return; }
+  if (!raw) { warn(`  updateActiveAlertFirestoreField: field missing for ${alertId}`); return false; }
 
   let obj;
-  try { obj = JSON.parse(raw); } catch(e) { warn(`  updateActiveAlertFirestoreField parse failed: ${e.message}`); return; }
+  try { obj = JSON.parse(raw); } catch(e) { warn(`  updateActiveAlertFirestoreField parse failed: ${e.message}`); return false; }
   Object.assign(obj, updates);
 
   const writeRes = await fetchJson(
@@ -1802,8 +1865,20 @@ async function updateActiveAlertFirestoreField(userId, alertId, updates) {
       body:    JSON.stringify({ fields: { [alertId]: { stringValue: JSON.stringify(obj) } } })
     }
   );
-  if (writeRes?.error) warn(`  updateActiveAlertFirestoreField write error: ${JSON.stringify(writeRes.error)}`);
-  else log(`  Firestore active_alerts field updated (repeating): ${alertId}`);
+  if (writeRes?.error) { warn(`  updateActiveAlertFirestoreField write error: ${JSON.stringify(writeRes.error)}`); return false; }
+
+  // Confirm — re-read and check every updated key matches
+  const verifyRes = await fetchJson(docUrl, { headers: authHdr });
+  const verifyRaw = verifyRes?.fields?.[alertId]?.stringValue;
+  if (!verifyRaw) return false;
+  try {
+    const verifyObj = JSON.parse(verifyRaw);
+    for (const k of Object.keys(updates)) {
+      if (verifyObj[k] !== updates[k]) return false;
+    }
+    log(`  Firestore active_alerts field confirmed (repeating): ${alertId}`);
+    return true;
+  } catch { return false; }
 }
 
 
@@ -1841,6 +1916,7 @@ async function sendFCM(userId, alert, hitPrice) {
         isSoundEnabled: String(alert.soundEnabled !== false),
         alertMode:       alert.alertMode === 'repeating' ? 'repeating' : 'once',
         cooldownMinutes: String(alert.cooldownMinutes || 5),
+        triggeredCount:  String(alert.triggeredCount || 0),
       },
       // notification field intentionally omitted for ALL message types.
       // Sending a notification field causes Android to show a system-generated
