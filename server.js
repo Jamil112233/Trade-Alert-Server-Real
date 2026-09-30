@@ -1265,6 +1265,7 @@ function checkAlerts() {
     try {
       const mode = alert.alertMode === 'repeating' ? 'repeating' : 'once';
       if (mode === 'once' && recentlyTriggered.has(alert.id)) continue;
+      if (alert.enabled === false) continue; // paused by the user (repeating alerts only)
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
       if (alert.candleClose) continue; // handled by checkCandleCloseAlerts at minute boundary
 
@@ -1500,6 +1501,7 @@ function checkCandleCloseAlerts(closedTfs) {
       if (mode === 'once' && recentlyTriggered.has(alert.id)) {
         log(`    SKIP ${alert.id}: recentlyTriggered`); continue;
       }
+      if (alert.enabled === false) { log(`    SKIP ${alert.id}: disabled by user`); continue; }
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
 
       // Skip when this symbol's market is currently closed — avoids firing on
