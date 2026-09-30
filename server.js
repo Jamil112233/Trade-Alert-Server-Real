@@ -568,9 +568,20 @@ function startRtdbListener() {
 // newest lastTriggeredAt. Side tracker is dropped if the target price was edited.
 function carryRuntimeState(oldAlert, newAlert) {
   if (!oldAlert || !newAlert) return newAlert;
-  if (oldAlert._lastSide && parseFloat(oldAlert.targetPrice) === parseFloat(newAlert.targetPrice)) {
+
+  const wasEnabled = oldAlert.enabled !== false;
+  const isEnabled  = newAlert.enabled !== false;
+
+  if (!wasEnabled && isEnabled) {
+    // Alert was paused and has just been resumed. Any crossing that happened
+    // while it was off is invisible to us and must NOT be treated as "the"
+    // crossing the instant it comes back on — force a silent re-baseline on
+    // the next check instead of firing immediately off stale movement.
+    newAlert._justReenabled = true; // _lastSide deliberately NOT carried over
+  } else if (oldAlert._lastSide && parseFloat(oldAlert.targetPrice) === parseFloat(newAlert.targetPrice)) {
     newAlert._lastSide = oldAlert._lastSide;
   }
+
   if ((oldAlert.lastTriggeredAt || 0) > (newAlert.lastTriggeredAt || 0)) {
     newAlert.lastTriggeredAt = oldAlert.lastTriggeredAt;
   }
@@ -681,6 +692,12 @@ function handleRtdbEvent(event, data) {
     if (parts.length === 1) {
       // Whole user's alerts changed
       const userId = parts[0];
+      // Snapshot the old per-alert state for this user BEFORE removing, so
+      // carryRuntimeState below can still compare old vs new per alert.
+      const oldAlertsForUser = {};
+      for (const id of Object.keys(activeAlerts)) {
+        if (activeAlerts[id].userId === userId) oldAlertsForUser[id] = activeAlerts[id];
+      }
       // Remove all alerts for this user first
       for (const id of Object.keys(activeAlerts)) {
         if (activeAlerts[id].userId === userId) delete activeAlerts[id];
@@ -689,7 +706,7 @@ function handleRtdbEvent(event, data) {
       if (value && typeof value === 'object') {
         for (const [alertId, alert] of Object.entries(value)) {
           if (alert && typeof alert === 'object') {
-            activeAlerts[alertId] = { ...alert, userId };
+            activeAlerts[alertId] = carryRuntimeState(oldAlertsForUser[alertId], { ...alert, userId });
           }
         }
       }
@@ -1321,6 +1338,16 @@ function checkRepeatingCrossing(alert, value) {
   const target = parseFloat(alert.targetPrice);
   if (!target) return;
   const currentSide = value >= target ? 'above' : 'below';
+
+  if (alert._justReenabled) {
+    // Just resumed after being paused — silently establish a fresh baseline
+    // from wherever price is right now and wait for the NEXT real crossing.
+    // Ignores whatever price did while the alert was disabled.
+    alert._justReenabled = false;
+    alert._lastSide = currentSide;
+    log(`  🔁 repeating alert ${alert.id} resumed — baseline set to '${currentSide}', no trigger`);
+    return;
+  }
 
   // First evaluation of this alert in this process: baseline = the side the price was
   // on when the alert was CREATED (alert.direction is "above" when the target sat above
