@@ -330,13 +330,6 @@ async function rtdbDelete(path) {
   return fetchJson(url, { method: 'DELETE' });
 }
 
-// PATCH updates only the given children of `path`, leaving sibling fields on
-// that node untouched (unlike PUT, which replaces the whole node).
-async function rtdbPatch(path, data) {
-  const url = `${FIREBASE_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
-  return fetchJson(url, { method: 'PATCH', body: JSON.stringify(data) });
-}
-
 // ── Bulletproof write helper for the trigger-processing pipeline ───────────
 // attemptFn does a write AND reads the value back from the server to confirm
 // it actually landed (not just that the HTTP call didn't throw) — same idea
@@ -702,11 +695,25 @@ function handleRtdbEvent(event, data) {
       for (const id of Object.keys(activeAlerts)) {
         if (activeAlerts[id].userId === userId) delete activeAlerts[id];
       }
-      // Add new ones
+      // Add new ones. Same 'put' vs 'patch' distinction as the single-alert
+      // branch below — a 'patch' here would only list the alertIds that
+      // changed, not this user's whole alert set, so a patch must be merged
+      // per-alert onto what's cached rather than treated as the full list
+      // (which the 'remove all for this user first' step above would then
+      // wrongly leave empty for every alert NOT included in the patch).
       if (value && typeof value === 'object') {
         for (const [alertId, alert] of Object.entries(value)) {
           if (alert && typeof alert === 'object') {
-            activeAlerts[alertId] = carryRuntimeState(oldAlertsForUser[alertId], { ...alert, userId });
+            const base   = event === 'patch' ? (oldAlertsForUser[alertId] || {}) : {};
+            const merged = { ...base, ...alert, userId };
+            activeAlerts[alertId] = carryRuntimeState(oldAlertsForUser[alertId], merged);
+          }
+        }
+        if (event === 'patch') {
+          // Restore every alert NOT touched by this patch — they were removed
+          // above but a patch never implied they were deleted.
+          for (const [alertId, old] of Object.entries(oldAlertsForUser)) {
+            if (!(alertId in value) && !activeAlerts[alertId]) activeAlerts[alertId] = old;
           }
         }
       }
@@ -722,9 +729,17 @@ function handleRtdbEvent(event, data) {
         delete activeAlerts[alertId];
         scheduleGateResubscribe();
       } else {
-        // Alert added or updated
-        activeAlerts[alertId] = carryRuntimeState(activeAlerts[alertId], { ...value, userId });
-        log(`RTDB alert added: ${alertId} (${value.pairSymbol} ${value.direction} ${value.targetPrice})`);
+        // Alert added or updated. A 'put' event's `value` is the FULL alert
+        // node; a 'patch' event's `value` is ONLY the fields that changed —
+        // every write this server makes is a full PUT (see processRepeatingTrigger),
+        // but this merge is kept as a safety net: if a 'patch' event ever does
+        // arrive, treating its partial value as the whole alert would wipe
+        // targetPrice/pairSymbol/direction/etc from the cache and silently
+        // stop this alert from ever being checked again.
+        const base   = event === 'patch' ? (activeAlerts[alertId] || {}) : {};
+        const merged = { ...base, ...value, userId };
+        activeAlerts[alertId] = carryRuntimeState(activeAlerts[alertId], merged);
+        log(`RTDB alert ${event === 'patch' ? 'patched' : 'added'}: ${alertId} (${merged.pairSymbol} ${merged.direction} ${merged.targetPrice})`);
         scheduleGateResubscribe();
       }
     }
@@ -1755,13 +1770,18 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
   alert.lastSide        = crossSide;
   alert.triggeredCount  = newCount;
 
-  // 1. RTDB — a single PATCH covering all 3 fields (PATCH only touches the
-  // given children, unlike PUT which would wipe the rest of the alert node),
-  // then a read-back to confirm the values actually landed on the server.
+  // 1. RTDB — write the WHOLE alert object back (not a partial PATCH of just
+  // 3 fields). A PATCH only delivers the changed fields in its own SSE event,
+  // and our own listener would otherwise merge that partial payload in as if
+  // it were the full alert — silently losing targetPrice/pairSymbol/direction/
+  // etc from the in-memory cache and making this alert go permanently silent.
+  // A full PUT of the canonical in-memory object (runtime-only fields and
+  // userId stripped — userId is implied by the path, not stored under it)
+  // sidesteps that risk entirely: same shape as every other RTDB write in
+  // this file, so there's nothing special to get wrong here.
   const rtdbOk = await withVerifiedRetry(`RTDB update (${alertId})`, async () => {
-    await rtdbPatch(`alerts/${userId}/${alertId}`, {
-      lastTriggeredAt: hitTime, lastSide: crossSide, triggeredCount: newCount
-    });
+    const { _lastSide, _justReenabled, userId: _uid, ...persistable } = alert;
+    await rtdbSet(`alerts/${userId}/${alertId}`, persistable);
     const check = await rtdbGet(`alerts/${userId}/${alertId}`);
     return !!check && check.lastTriggeredAt === hitTime && check.triggeredCount === newCount;
   });
