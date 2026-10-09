@@ -2058,6 +2058,9 @@ function startHealthServer() {
         timeframe:   a.timeframe || '',
         label:       a.label || '',
         createdAt:   a.createdAt || 0,
+        alertMode:       a.alertMode === 'repeating' ? 'repeating' : 'once',
+        cooldownMinutes: a.alertMode === 'repeating' ? (a.cooldownMinutes || 0) : 0,
+        enabled:         a.enabled !== false, // false = repeating alert paused by the user
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ total: list.length, alerts: list, updatedAt: Date.now() }));
