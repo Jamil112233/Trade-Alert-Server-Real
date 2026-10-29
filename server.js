@@ -1983,6 +1983,18 @@ async function sendFCM(userId, alert, hitPrice) {
   const priceStr = formatPrice(hitPrice, alert.pairSymbol);
   const dirLabel = alert.direction === 'above' ? '📈 Above' : '📉 Below';
 
+  // Layout (folder) the alert lives in — id + display name for notification / alarm screen
+  const layoutId = (alert.layout && String(alert.layout).trim()) ? String(alert.layout) : 'main';
+  let layoutName = 'Main';
+  if (layoutId !== 'main') {
+    layoutName = 'Main'; // unknown / deleted layout falls back to Main (same as the app)
+    const lays = userDoc?.fields?.layouts?.arrayValue?.values || [];
+    for (const l of lays) {
+      const f = l?.mapValue?.fields;
+      if (f?.id?.stringValue === layoutId && f?.name?.stringValue) { layoutName = f.name.stringValue; break; }
+    }
+  }
+
   const message = {
     message: {
       token: fcmToken,
@@ -2003,6 +2015,8 @@ async function sendFCM(userId, alert, hitPrice) {
         alertMode:       alert.alertMode === 'repeating' ? 'repeating' : 'once',
         cooldownMinutes: String(alert.cooldownMinutes || 5),
         triggeredCount:  String(alert.triggeredCount || 0),
+        layout:          layoutId,
+        layoutName:      layoutName,
       },
       // notification field intentionally omitted for ALL message types.
       // Sending a notification field causes Android to show a system-generated
