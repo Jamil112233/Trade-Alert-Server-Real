@@ -1622,6 +1622,37 @@ function startMinuteBoundaryChecker() {
 // SECTION 10 — TRIGGER PROCESSING
 // ════════════════════════════════════════════════════════════════════════════
 
+// ── Layout name lookup (admin panel trigger log only) ───────────────────────
+// Alerts store a layout ID ("main" or "lay_xxxxxxxx"); the readable name lives in
+// users/{uid}.layouts = [{id, name}]. Cached per user for 5 minutes so a burst of
+// triggers costs at most one read. Any failure falls back to the ID — a trigger
+// must never fail because of a name lookup.
+const layoutNameCache = new Map(); // userId -> { at, names: { id: name } }
+async function getLayoutName(userId, layoutId) {
+  if (!layoutId || layoutId === 'main') return 'Main';
+  try {
+    let entry = layoutNameCache.get(userId);
+    if (!entry || Date.now() - entry.at > 5 * 60 * 1000) {
+      const token = await getAccessToken();
+      const doc = await fetchJson(
+        `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}`,
+        { headers: { 'Authorization': `Bearer ${token}` } }
+      );
+      const names = {};
+      const vals = doc?.fields?.layouts?.arrayValue?.values || [];
+      for (const v of vals) {
+        const f = v?.mapValue?.fields;
+        if (f?.id?.stringValue && f?.name?.stringValue) names[f.id.stringValue] = f.name.stringValue;
+      }
+      entry = { at: Date.now(), names };
+      layoutNameCache.set(userId, entry);
+    }
+    return entry.names[layoutId] || layoutId;
+  } catch (e) {
+    return layoutId;
+  }
+}
+
 async function processTriggeredAlert(alert, hitPrice) {
   const alertId = alert.id;
   const userId  = alert.userId;
@@ -1679,7 +1710,8 @@ async function processTriggeredAlert(alert, hitPrice) {
   // 3. Write to Firestore history field
   try {
     const token    = await getAccessToken();
-    const hitAlert = { ...alert, triggered: true, hitAt: hitTime };
+    // layout (folder) is kept on the history entry; alerts created before layouts existed → 'main'
+    const hitAlert = { ...alert, triggered: true, hitAt: hitTime, layout: alert.layout || 'main' };
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
     const res3 = await fetchJson(
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
@@ -1717,6 +1749,8 @@ async function processTriggeredAlert(alert, hitPrice) {
       pair:        { stringValue: String(alert.pairSymbol || alert.pair || '') },
       targetPrice: { doubleValue: Number(alert.targetPrice) || 0 },
       candleClose: { booleanValue: !!alert.candleClose },
+      layoutId:    { stringValue: alert.layout || 'main' },
+      layout:      { stringValue: await getLayoutName(userId, alert.layout || 'main') },
       triggerTime: { stringValue: pkTimeFull(hitTime) },
     };
     const res4 = await fetchJson(
@@ -1802,7 +1836,8 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
     // history list off this "id" field, and reusing the live id would
     // collide with the active alert when the app syncs.
     const hitAlert = { ...alert, id: historyId, direction: crossSide, triggered: true,
-                        hitAt: hitTime, active: false, triggeredCount: newCount };
+                        hitAt: hitTime, active: false, triggeredCount: newCount,
+                        layout: alert.layout || 'main' };
     delete hitAlert._lastSide;
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
     const commitUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`;
@@ -1848,6 +1883,8 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
       repeating:       { booleanValue: true },
       triggeredCount:  { integerValue: String(newCount) },
       cooldownMinutes: { integerValue: String(parseInt(alert.cooldownMinutes, 10) || 5) },
+      layoutId:        { stringValue: alert.layout || 'main' },
+      layout:          { stringValue: await getLayoutName(userId, alert.layout || 'main') },
       triggerTime:     { stringValue: pkTimeFull(hitTime) },
     };
     const res = await fetchJson(
@@ -2057,6 +2094,7 @@ function startHealthServer() {
         candleClose: !!a.candleClose,
         timeframe:   a.timeframe || '',
         label:       a.label || '',
+        layout:      a.layout || 'main',
         createdAt:   a.createdAt || 0,
         alertMode:       a.alertMode === 'repeating' ? 'repeating' : 'once',
         cooldownMinutes: a.alertMode === 'repeating' ? (a.cooldownMinutes || 0) : 0,
