@@ -583,9 +583,7 @@ function carryRuntimeState(oldAlert, newAlert) {
 
   // EMA alerts: keep the in-memory side tracker unless the indicator setup was edited
   if (oldAlert._emaSide && newAlert.alertKind === 'indicator'
-      && indPeriodOf(oldAlert) === indPeriodOf(newAlert)
-      && oldAlert.timeframe === newAlert.timeframe
-      && !!oldAlert.candleClose === !!newAlert.candleClose) {
+      && indSetupSig(oldAlert) === indSetupSig(newAlert)) {
     newAlert._emaSide = oldAlert._emaSide;
     newAlert._emaWait = oldAlert._emaWait;
     if (!newAlert.lastSide && oldAlert.lastSide) newAlert.lastSide = oldAlert.lastSide;
@@ -2007,7 +2005,7 @@ async function sendFCM(userId, alert, hitPrice) {
   const isAlarm  = alert.alarm === true;
   const isIndicator = alert.alertKind === 'indicator';
   const hitType  = isIndicator
-    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · EMA ${alert.indicatorPeriod} · ${alert.timeframe}`
+    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · ${alert.indicatorMode === 'crossover' ? `EMA ${alert.indicatorPeriod} × EMA ${alert.indicatorPeriod2} Cross` : `EMA ${alert.indicatorPeriod}`} · ${alert.timeframe}`
     : (alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit');
   const priceStr = formatPrice(hitPrice, alert.pairSymbol);
   const dirLabel = alert.direction === 'above' ? '📈 Above' : '📉 Below';
@@ -2048,6 +2046,7 @@ async function sendFCM(userId, alert, hitPrice) {
         indicatorType:   String(alert.indicatorType || ''),
         indicatorMode:   String(alert.indicatorMode || ''),
         indicatorPeriod: String(alert.indicatorPeriod || 0),
+        indicatorPeriod2: String(alert.indicatorPeriod2 || 0),
         timeframe:       String(alert.timeframe || ''),
         layout:          layoutId,
         layoutName:      layoutName,
@@ -2164,6 +2163,7 @@ function startHealthServer() {
         indicatorType:   a.indicatorType || '',
         indicatorMode:   a.indicatorMode || '',
         indicatorPeriod: a.indicatorPeriod || 0,
+        indicatorPeriod2: a.indicatorPeriod2 || 0,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ total: list.length, alerts: list, updatedAt: Date.now() }));
@@ -2279,15 +2279,28 @@ function indPeriodOf(a) {
   return Number.isFinite(p) ? p : 0;
 }
 
-/** True when this alert is an EMA single-line alert this engine can monitor. */
+/** Crossover: second EMA period (indicatorPeriod = EMA 1, indicatorPeriod2 = EMA 2). */
+function indPeriod2Of(a) {
+  const p = parseInt(a.indicatorPeriod2, 10);
+  return Number.isFinite(p) ? p : 0;
+}
+function indIsCross(a) { return a.indicatorMode === 'crossover'; }
+/** Every EMA period this alert needs. */
+function indPeriodsOf(a) { return indIsCross(a) ? [indPeriodOf(a), indPeriod2Of(a)] : [indPeriodOf(a)]; }
+/** Short label for logs, e.g. "EMA50" or "EMA9×EMA21". */
+function indLabel(a) { return indIsCross(a) ? `EMA${indPeriodOf(a)}×EMA${indPeriod2Of(a)}` : `EMA${indPeriodOf(a)}`; }
+/** Signature of the indicator setup — if it changes (edit), the stored side must be forgotten. */
+function indSetupSig(a) { return `${a.indicatorMode}|${indPeriodOf(a)}|${indIsCross(a) ? indPeriod2Of(a) : 0}|${a.timeframe}|${a.candleClose ? 1 : 0}`; }
+
+/** True when this alert is an EMA alert (single or crossover) this engine can monitor. */
 function indIsValid(a) {
-  return !!a
-    && a.alertKind === 'indicator'
-    && a.indicatorType === 'ema'
-    && a.indicatorMode === 'single'
-    && indPeriodOf(a) >= IND_MIN_PERIOD && indPeriodOf(a) <= IND_MAX_PERIOD
-    && !!IND_TF_MS[a.timeframe]
-    && !!indSource(a.pairSymbol);
+  if (!a || a.alertKind !== 'indicator' || a.indicatorType !== 'ema') return false;
+  if (a.indicatorMode !== 'single' && a.indicatorMode !== 'crossover') return false;
+  if (!IND_TF_MS[a.timeframe] || !indSource(a.pairSymbol)) return false;
+  const ps = indPeriodsOf(a);
+  if (!ps.every(p => p >= IND_MIN_PERIOD && p <= IND_MAX_PERIOD)) return false;
+  if (indIsCross(a) && ps[0] === ps[1]) return false;                    // two identical EMAs can never cross
+  return true;
 }
 
 function indKey(sym, tf) { return `${sym}|${tf}`; }
@@ -2430,7 +2443,7 @@ function syncIndicatorStates() {
     if (!indIsValid(a)) continue;
     const key = indKey(a.pairSymbol, a.timeframe);
     if (!wanted.has(key)) wanted.set(key, new Set());
-    wanted.get(key).add(indPeriodOf(a));
+    for (const p of indPeriodsOf(a)) wanted.get(key).add(p);
   }
   const now = Date.now();
 
@@ -2617,9 +2630,13 @@ function indFire(alert, hitPrice, emaValue, hitSide, kindLabel) {
     const now = Date.now();
     if (now - (alert.lastTriggeredAt || 0) < cooldownMs) {
       log(`  🔁 EMA alert ${alert.id} ${kindLabel} (${hitSide}) but in cooldown — crossing consumed`);
+      alert.lastSide = hitSide;                                          // keep RTDB in step so a restart can't replay it
+      if (activeAlerts[alert.id]) {
+        rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, hitSide).catch(() => {});
+      }
       return;
     }
-    log(`🎯🔁 EMA repeating alert triggered: ${alert.pairSymbol} ${kindLabel} EMA${indPeriodOf(alert)} ${alert.timeframe} → ${hitSide} (ema=${emaValue} price=${hitPrice}) user=${alert.userId}`);
+    log(`🎯🔁 EMA repeating alert triggered: ${alert.pairSymbol} ${kindLabel} ${indLabel(alert)} ${alert.timeframe} → ${hitSide} (ema=${emaValue} price=${hitPrice}) user=${alert.userId}`);
     processRepeatingTrigger(alert, hitPrice, hitSide, emaValue)
       .catch(e => err(`processRepeatingTrigger (EMA) error: ${e.message}`));
     return;
@@ -2627,7 +2644,7 @@ function indFire(alert, hitPrice, emaValue, hitSide, kindLabel) {
 
   if (recentlyTriggered.has(alert.id)) return;
   recentlyTriggered.add(alert.id);
-  log(`🎯 EMA alert triggered: ${alert.pairSymbol} ${kindLabel} EMA${indPeriodOf(alert)} ${alert.timeframe} → ${hitSide} (ema=${emaValue} price=${hitPrice}) user=${alert.userId}`);
+  log(`🎯 EMA alert triggered: ${alert.pairSymbol} ${kindLabel} ${indLabel(alert)} ${alert.timeframe} → ${hitSide} (ema=${emaValue} price=${hitPrice}) user=${alert.userId}`);
   // The alert is removed right after this, so it's safe to stamp the EMA level + side on it:
   // history card, FCM and admin log then show "EMA value hit" and the side it crossed to.
   alert.targetPrice = emaValue;
@@ -2638,6 +2655,56 @@ function indFire(alert, hitPrice, emaValue, hitSide, kindLabel) {
   });
 }
 
+/**
+ * CROSSOVER baseline: which EMA is above the other. "above" = EMA 1 above EMA 2.
+ * Persisted in RTDB (`lastSide`) so a restart remembers the position; if the position
+ * changed while the server was down, the next evaluation sees the flip and fires.
+ */
+function indEnsureCrossBaseline(alert, diff) {
+  if (alert._emaSide) return true;
+  if (alert.lastSide === 'above' || alert.lastSide === 'below') { alert._emaSide = alert.lastSide; return true; }
+  if (diff === 0) return false;                                          // exactly equal → no position yet
+  alert._emaSide = diff > 0 ? 'above' : 'below';
+  alert.lastSide = alert._emaSide;
+  if (activeAlerts[alert.id]) {
+    rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, alert._emaSide)
+      .catch(e => warn(`  EMA cross baseline persist failed ${alert.id}: ${e.message}`));
+  }
+  log(`  📈 EMA cross alert ${alert.id} baseline: ${indLabel(alert)} → EMA${indPeriodOf(alert)} is ${alert._emaSide} EMA${indPeriod2Of(alert)}`);
+  return true;
+}
+
+/** Returns the side to fire ('above'/'below') or null. Strict: equal EMAs are not a crossover. */
+function indCrossHit(alert, diff) {
+  if (alert._emaSide === 'above' && diff < 0) return 'below';
+  if (alert._emaSide === 'below' && diff > 0) return 'above';
+  return null;
+}
+
+/** Crossover TOUCH: both EMAs as they would be with the live price in the forming candle. Zero network. */
+function indTouchCross(alert, g, price) {
+  const s1 = g.periods.get(indPeriodOf(alert)), s2 = g.periods.get(indPeriod2Of(alert));
+  if (!s1 || !s2 || !s1.ready || !s2.ready) return;
+  const l1 = price * s1.k + s1.ema * (1 - s1.k);
+  const l2 = price * s2.k + s2.ema * (1 - s2.k);
+  const diff = l1 - l2;
+  if (!indEnsureCrossBaseline(alert, diff)) return;
+  const hitSide = indCrossHit(alert, diff);
+  if (!hitSide) return;
+  indFire(alert, price, (l1 + l2) / 2, hitSide, 'Touch');
+}
+
+/** Crossover CANDLE CONFIRMATION: EMAs already include the freshly closed candle. */
+function indCandleCross(alert, g, candle) {
+  const s1 = g.periods.get(indPeriodOf(alert)), s2 = g.periods.get(indPeriod2Of(alert));
+  if (!s1 || !s2 || !s1.ready || !s2.ready) return;
+  const diff = s1.ema - s2.ema;
+  if (!indEnsureCrossBaseline(alert, diff)) return;
+  const hitSide = indCrossHit(alert, diff);
+  if (!hitSide) return;
+  indFire(alert, candle.c, (s1.ema + s2.ema) / 2, hitSide, 'Candle Confirmation');
+}
+
 /** TOUCH — every second, zero network. */
 function checkIndicatorTouchAlerts() {
   if (!indGroups.size) return;
@@ -2646,6 +2713,12 @@ function checkIndicatorTouchAlerts() {
       if (alert.candleClose || !indIsValid(alert)) continue;
       if (indShouldSkip(alert)) continue;
       const g  = indGroups.get(indKey(alert.pairSymbol, alert.timeframe));
+      if (g && indIsCross(alert)) {
+        if (!g.ready || !indMarketOpen(alert.pairSymbol)) continue;
+        const px = livePrice[alert.pairSymbol];
+        if (px > 0) indTouchCross(alert, g, px);
+        continue;
+      }
       const st = g && g.periods.get(indPeriodOf(alert));
       if (!st || !st.ready || !g.ready) continue;
       if (!indMarketOpen(alert.pairSymbol)) continue;                    // stale weekend price — same rule as price alerts
@@ -2677,6 +2750,7 @@ function indEvaluateCandleConfirm(g, candle) {
       if (!alert.candleClose || !indIsValid(alert)) continue;
       if (alert.pairSymbol !== g.sym || alert.timeframe !== g.tf) continue;
       if (indShouldSkip(alert)) continue;
+      if (indIsCross(alert)) { indCandleCross(alert, g, candle); continue; }
       const st = g.periods.get(indPeriodOf(alert));
       if (!st || !st.ready) continue;
       const e = st.ema;                                                  // EMA including this closed candle
