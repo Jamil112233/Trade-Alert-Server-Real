@@ -12,6 +12,8 @@
  *                               triggers Gate.io resubscribe when alert set changes
  *   5. Price checker          → every second, checks all cached alerts vs live prices
  *   6. On trigger             → FCM → delete RTDB alert → update Firestore
+ *   7. Indicator engine       → EMA alerts (Section 12): history once per pair+timeframe, then 1 tiny
+ *                               candle fetch per close; Touch checked every second from memory
  *
  * Bandwidth optimizations:
  *   - Gate.io WS: subscribes only to pairs that have at least one active alert
@@ -178,7 +180,7 @@ function getActiveYahooPairs() {
 function getActiveCandleCloseCryptoPairs(tf) {
   const pairs = new Set();
   for (const alert of Object.values(activeAlerts)) {
-    if (alert.candleClose && alert.timeframe === tf && GATE_SYMBOLS_SET.has(alert.pairSymbol)) {
+    if (alert.candleClose && alert.alertKind !== 'indicator' && alert.timeframe === tf && GATE_SYMBOLS_SET.has(alert.pairSymbol)) {
       pairs.add(alert.pairSymbol);
     }
   }
@@ -577,6 +579,16 @@ function carryRuntimeState(oldAlert, newAlert) {
 
   if ((oldAlert.lastTriggeredAt || 0) > (newAlert.lastTriggeredAt || 0)) {
     newAlert.lastTriggeredAt = oldAlert.lastTriggeredAt;
+  }
+
+  // EMA alerts: keep the in-memory side tracker unless the indicator setup was edited
+  if (oldAlert._emaSide && newAlert.alertKind === 'indicator'
+      && indPeriodOf(oldAlert) === indPeriodOf(newAlert)
+      && oldAlert.timeframe === newAlert.timeframe
+      && !!oldAlert.candleClose === !!newAlert.candleClose) {
+    newAlert._emaSide = oldAlert._emaSide;
+    newAlert._emaWait = oldAlert._emaWait;
+    if (!newAlert.lastSide && oldAlert.lastSide) newAlert.lastSide = oldAlert.lastSide;
   }
   return newAlert;
 }
@@ -1292,6 +1304,8 @@ function checkAlerts() {
   }
   if (!alertList.length) return;
 
+  try { checkIndicatorTouchAlerts(); } catch (e) { warn(`checkIndicatorTouchAlerts error: ${e.message}`); } // EMA "Touch" — in-memory only
+
   const nowMs = Date.now();
   for (const alert of alertList) {
     try {
@@ -1299,6 +1313,7 @@ function checkAlerts() {
       if (mode === 'once' && recentlyTriggered.has(alert.id)) continue;
       if (alert.enabled === false) continue; // paused by the user (repeating alerts only)
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
+      if (alert.alertKind === 'indicator') continue; // EMA alerts → Section 12 (indicator engine)
       if (alert.candleClose) continue; // handled by checkCandleCloseAlerts at minute boundary
 
       // Skip when this symbol's market is currently closed — livePrice may hold a
@@ -1477,7 +1492,7 @@ async function onMinuteClose() {
         // Only fetch if there's at least one candle-close alert for this sym+tf
         // (instant alerts don't need candle data)
         const hasCandleAlert = Object.values(activeAlerts).some(
-          a => a.candleClose && a.timeframe === tf && a.pairSymbol === sym
+          a => a.candleClose && a.alertKind !== 'indicator' && a.timeframe === tf && a.pairSymbol === sym
         );
         if (!hasCandleAlert) continue;
         const interval = yahooIntervalMap[tf];
@@ -1529,10 +1544,10 @@ async function onMinuteClose() {
 
 function checkCandleCloseAlerts(closedTfs) {
   const all       = Object.values(activeAlerts);
-  const alertList = all.filter(a => a.candleClose && closedTfs.includes(a.timeframe));
+  const alertList = all.filter(a => a.candleClose && a.alertKind !== 'indicator' && closedTfs.includes(a.timeframe));
 
   log(`  checkCandleCloseAlerts: ${all.length} total, ${alertList.length} match [${closedTfs.join(',')}]`);
-  all.filter(a => a.candleClose).forEach(a =>
+  all.filter(a => a.candleClose && a.alertKind !== 'indicator').forEach(a =>
     log(`    alert: ${a.pairSymbol} ${a.direction} ${a.targetPrice} tf=${a.timeframe} candleClose=${a.candleClose}`)
   );
 
@@ -1614,6 +1629,7 @@ function startMinuteBoundaryChecker() {
         }
       }
       onMinuteClose().catch(e => warn(`onMinuteClose error: ${e.message}`));
+      try { onIndicatorBoundary(minNow); } catch (e) { warn(`onIndicatorBoundary error: ${e.message}`); }
     }
   }, 500);
 }
@@ -1712,6 +1728,8 @@ async function processTriggeredAlert(alert, hitPrice) {
     const token    = await getAccessToken();
     // layout (folder) is kept on the history entry; alerts created before layouts existed → 'main'
     const hitAlert = { ...alert, triggered: true, hitAt: hitTime, layout: alert.layout || 'main' };
+    delete hitAlert._emaSide;
+    delete hitAlert._emaWait;
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
     const res3 = await fetchJson(
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
@@ -1749,6 +1767,7 @@ async function processTriggeredAlert(alert, hitPrice) {
       pair:        { stringValue: String(alert.pairSymbol || alert.pair || '') },
       targetPrice: { doubleValue: Number(alert.targetPrice) || 0 },
       candleClose: { booleanValue: !!alert.candleClose },
+      alertKind:   { stringValue: alert.alertKind === 'indicator' ? 'indicator' : 'price' },
       layoutId:    { stringValue: alert.layout || 'main' },
       layout:      { stringValue: await getLayoutName(userId, alert.layout || 'main') },
       triggerTime: { stringValue: pkTimeFull(hitTime) },
@@ -1791,7 +1810,9 @@ async function processTriggeredAlert(alert, hitPrice) {
 // RTDB, Firestore) so the cooldown survives a server restart.
 // ════════════════════════════════════════════════════════════════════════════
 
-async function processRepeatingTrigger(alert, hitPrice, crossSide) {
+async function processRepeatingTrigger(alert, hitPrice, crossSide, hitTarget) {
+  // hitTarget (optional): the level that was hit — the EMA value for indicator alerts. Shown in
+  // history / FCM / admin log; the live alert itself keeps targetPrice 0.
   const alertId    = alert.id;
   const userId     = alert.userId;
   const hitTime    = Date.now();
@@ -1814,7 +1835,7 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
   // sidesteps that risk entirely: same shape as every other RTDB write in
   // this file, so there's nothing special to get wrong here.
   const rtdbOk = await withVerifiedRetry(`RTDB update (${alertId})`, async () => {
-    const { _lastSide, _justReenabled, userId: _uid, ...persistable } = alert;
+    const { _lastSide, _justReenabled, _emaSide, _emaWait, userId: _uid, ...persistable } = alert;
     await rtdbSet(`alerts/${userId}/${alertId}`, persistable);
     const check = await rtdbGet(`alerts/${userId}/${alertId}`);
     return !!check && check.lastTriggeredAt === hitTime && check.triggeredCount === newCount;
@@ -1838,7 +1859,10 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
     const hitAlert = { ...alert, id: historyId, direction: crossSide, triggered: true,
                         hitAt: hitTime, active: false, triggeredCount: newCount,
                         layout: alert.layout || 'main' };
+    if (hitTarget != null) hitAlert.targetPrice = hitTarget;
     delete hitAlert._lastSide;
+    delete hitAlert._emaSide;
+    delete hitAlert._emaWait;
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
     const commitUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`;
     const authHdr   = { 'Authorization': `Bearer ${token}` };
@@ -1878,8 +1902,9 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
     const triggerMapFields = {
       userId:          { stringValue: String(alert.userId || userId || '') },
       pair:            { stringValue: String(alert.pairSymbol || '') },
-      targetPrice:     { doubleValue: Number(alert.targetPrice) || 0 },
+      targetPrice:     { doubleValue: Number(hitTarget != null ? hitTarget : alert.targetPrice) || 0 },
       candleClose:     { booleanValue: !!alert.candleClose },
+      alertKind:       { stringValue: alert.alertKind === 'indicator' ? 'indicator' : 'price' },
       repeating:       { booleanValue: true },
       triggeredCount:  { integerValue: String(newCount) },
       cooldownMinutes: { integerValue: String(parseInt(alert.cooldownMinutes, 10) || 5) },
@@ -1910,7 +1935,8 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide) {
   // no-op on the client even if the first one actually did arrive.
   const fcmOk = await withVerifiedRetry(`FCM send (${alertId})`, async () => {
     try {
-      await sendFCM(userId, { ...alert, direction: crossSide, triggeredCount: newCount }, hitPrice);
+      await sendFCM(userId, { ...alert, direction: crossSide, triggeredCount: newCount,
+                              ...(hitTarget != null ? { targetPrice: hitTarget } : {}) }, hitPrice);
       return true;
     } catch (e) { warn(`  sendFCM threw: ${e.message}`); return false; }
   }, 2);
@@ -1979,7 +2005,10 @@ async function sendFCM(userId, alert, hitPrice) {
   if (!fcmToken) { warn(`No FCM token for user ${userId}`); return; }
 
   const isAlarm  = alert.alarm === true;
-  const hitType  = alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit';
+  const isIndicator = alert.alertKind === 'indicator';
+  const hitType  = isIndicator
+    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · EMA ${alert.indicatorPeriod} · ${alert.timeframe}`
+    : (alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit');
   const priceStr = formatPrice(hitPrice, alert.pairSymbol);
   const dirLabel = alert.direction === 'above' ? '📈 Above' : '📉 Below';
 
@@ -2015,6 +2044,11 @@ async function sendFCM(userId, alert, hitPrice) {
         alertMode:       alert.alertMode === 'repeating' ? 'repeating' : 'once',
         cooldownMinutes: String(alert.cooldownMinutes || 5),
         triggeredCount:  String(alert.triggeredCount || 0),
+        alertKind:       isIndicator ? 'indicator' : 'price',
+        indicatorType:   String(alert.indicatorType || ''),
+        indicatorMode:   String(alert.indicatorMode || ''),
+        indicatorPeriod: String(alert.indicatorPeriod || 0),
+        timeframe:       String(alert.timeframe || ''),
         layout:          layoutId,
         layoutName:      layoutName,
       },
@@ -2084,6 +2118,19 @@ function startHealthServer() {
       return;
     }
 
+    // EMA engine state — secret-gated; compare these EMA values with TradingView to verify accuracy.
+    if (req.url === '/admin/indicators') {
+      const secret = req.headers['x-admin-secret'];
+      if (!process.env.ADMIN_PANEL_SECRET || secret !== process.env.ADMIN_PANEL_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ...indDebugSnapshot(), updatedAt: Date.now() }));
+      return;
+    }
+
     // Full per-alert list, for the admin panel's Active Alerts browser page.
     // Same auth as /admin/active-alerts above; also free — this data is
     // already sitting in memory, this just serializes the fields the admin
@@ -2113,6 +2160,10 @@ function startHealthServer() {
         alertMode:       a.alertMode === 'repeating' ? 'repeating' : 'once',
         cooldownMinutes: a.alertMode === 'repeating' ? (a.cooldownMinutes || 0) : 0,
         enabled:         a.enabled !== false, // false = repeating alert paused by the user
+        alertKind:       a.alertKind === 'indicator' ? 'indicator' : 'price',
+        indicatorType:   a.indicatorType || '',
+        indicatorMode:   a.indicatorMode || '',
+        indicatorPeriod: a.indicatorPeriod || 0,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ total: list.length, alerts: list, updatedAt: Date.now() }));
@@ -2163,6 +2214,500 @@ function startHealthServer() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SECTION 12 — INDICATOR ENGINE (EMA alerts — Trade Alert Pro)
+//
+// Alerts with alertKind = "indicator" (indicatorType "ema", indicatorMode "single")
+// carry NO fixed target price (targetPrice = 0). Instead the level is the EMA:
+//
+//     k = 2 / (N + 1)        EMA = close × k + previousEMA × (1 − k)
+//
+// ONE state per (pair, timeframe, period), shared by every user's alert with that
+// combination — cost scales with distinct combinations, never with user count.
+//
+// History:  fetched ONCE per (pair, timeframe) when the first alert appears (and again
+//           after a restart/deploy — it lives only in memory). After that, each candle
+//           close fetches only the NEWEST candle(s) and updates the EMA recursively.
+// Sources:  crypto → Gate.io · forex/indices → Yahoo · XAU/XAG → Capital.com REST history
+//           (bootstrap only; after that metals use the same minute-boundary price
+//           snapshot the existing candle-close alerts already use).
+//
+// Hit logic (side = which side of the EMA the price was on when the alert was created):
+//   Touch               price reaches the EMA from its creation side. NOTE: the EMA line
+//                       moves with the forming candle, but price − liveEMA always has the
+//                       same sign as price − lastClosedEMA, so "price meets the live line"
+//                       is exactly "price meets the last closed EMA value" — no extra math.
+//   Candle Confirmation a candle CLOSES on the opposite side of the EMA (close vs the EMA
+//                       value that includes that candle).
+//   Once      → fires, alert removed.
+//   Repeating → fires, side flips, waits for the opposite side again (+ cooldown), exactly
+//               like price alerts. The side is persisted in RTDB (`lastSide`).
+// ════════════════════════════════════════════════════════════════════════════
+
+const IND_TF_MS = { M1: 60000, M5: 300000, M15: 900000, H1: 3600000 };
+const IND_MIN_PERIOD = 3;
+const IND_MAX_PERIOD = 500;
+const IND_WARMUP_FACTOR = 5;      // history candles ≈ 5 × period (error from the SMA seed → ~0.005%)
+const IND_MAX_PAGES = 8;          // safety cap on paged history requests
+const IND_MAX_PARALLEL_BOOTS = 3; // never bootstrap more than this many groups at once
+const IND_UNUSED_GRACE_MS = 10 * 60 * 1000; // keep a state this long after its last alert is gone
+
+const GATE_INTERVAL    = { M1: '1m', M5: '5m', M15: '15m', H1: '1h' };
+const YAHOO_INTERVAL   = { M1: '1m', M5: '5m', M15: '15m', H1: '60m' };
+const CAP_RESOLUTION   = { M1: 'MINUTE', M5: 'MINUTE_5', M15: 'MINUTE_15', H1: 'HOUR' };
+// Yahoo only keeps limited history per interval
+const YAHOO_MAX_SPAN_MS = { M1: 6.5 * 86400000, M5: 58 * 86400000, M15: 58 * 86400000, H1: 700 * 86400000 };
+const YAHOO_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json'
+};
+
+// key `${sym}|${tf}` → group { sym, tf, tfMs, source, periods: Map(period → state), lastOpen, ready, ... }
+const indGroups = new Map();
+let indBootsRunning = 0;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function indSource(sym) {
+  if (GATE_SYMBOLS_SET.has(sym)) return 'gate';
+  if (sym === 'XAU' || sym === 'XAG') return 'capital';
+  if (YAHOO_SYMBOLS_KEYS.has(sym)) return 'yahoo';
+  return null; // e.g. USDGBP (derived from GBPUSD) — not supported for indicators yet
+}
+
+function indPeriodOf(a) {
+  const p = parseInt(a.indicatorPeriod, 10);
+  return Number.isFinite(p) ? p : 0;
+}
+
+/** True when this alert is an EMA single-line alert this engine can monitor. */
+function indIsValid(a) {
+  return !!a
+    && a.alertKind === 'indicator'
+    && a.indicatorType === 'ema'
+    && a.indicatorMode === 'single'
+    && indPeriodOf(a) >= IND_MIN_PERIOD && indPeriodOf(a) <= IND_MAX_PERIOD
+    && !!IND_TF_MS[a.timeframe]
+    && !!indSource(a.pairSymbol);
+}
+
+function indKey(sym, tf) { return `${sym}|${tf}`; }
+
+function indMarketOpen(sym) {
+  if (sym === 'XAU' || sym === 'XAG') return isMetalsOpen();
+  if (YAHOO_SYMBOLS_KEYS.has(sym))    return isYahooSymbolOpen(sym);
+  return true; // crypto trades 24/7
+}
+
+function indEmaFromCloses(closes, period) {
+  const k = 2 / (period + 1);
+  let ema = 0;
+  for (let i = 0; i < period; i++) ema += closes[i];
+  ema /= period;                                   // seed = SMA of the first N closes
+  for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
+  return ema;
+}
+
+// ── candle fetchers (each returns ascending [{t: openTimeMs, c: close}], may include forming candle) ──
+
+async function indFetchGate(sym, tf, fromMs, toMs) {
+  const tfMs = IND_TF_MS[tf];
+  const gSym = GATE_SYMBOLS[sym];
+  const out  = [];
+  let start  = Math.ceil(fromMs / tfMs) * tfMs;
+  let pages  = 0;
+  while (start <= toMs) {
+    if (++pages > IND_MAX_PAGES) throw new Error('gap too large (pages)');
+    const end = Math.min(toMs, start + 999 * tfMs);         // ≤ 1000 points per request
+    const url = `https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=${gSym}`
+              + `&interval=${GATE_INTERVAL[tf]}&from=${Math.floor(start / 1000)}&to=${Math.floor(end / 1000)}`;
+    const res = await fetchJson(url);
+    if (!Array.isArray(res)) throw new Error(`Gate candles bad response: ${JSON.stringify(res).slice(0, 120)}`);
+    for (const r of res) {                                   // [t, quoteVol, close, high, low, open, ...]
+      const t = parseInt(r[0], 10) * 1000;
+      const c = parseFloat(r[2]);
+      if (t >= fromMs && c > 0) out.push({ t, c });
+    }
+    start = end + tfMs;
+  }
+  return out;
+}
+
+async function indFetchYahoo(sym, tf, fromMs, toMs) {
+  if (toMs - fromMs > YAHOO_MAX_SPAN_MS[tf]) throw new Error('gap too large (yahoo span)');
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${YAHOO_SYMBOLS[sym]}`
+            + `?interval=${YAHOO_INTERVAL[tf]}&period1=${Math.floor(fromMs / 1000)}&period2=${Math.ceil(toMs / 1000) + 60}`;
+  const res    = await fetchJson(url, { headers: YAHOO_HEADERS });
+  const result = res?.chart?.result?.[0];
+  const times  = result?.timestamp;
+  const closes = result?.indicators?.quote?.[0]?.close;
+  if (!result) {
+    // Yahoo answers {chart:{result:null,error:{...}}} when the window holds no candles — not a failure
+    if (res?.chart?.error && /no data|not found/i.test(JSON.stringify(res.chart.error))) return [];
+    throw new Error(`Yahoo candles bad response: ${JSON.stringify(res).slice(0, 120)}`);
+  }
+  const out = [];
+  if (Array.isArray(times) && Array.isArray(closes)) {
+    for (let i = 0; i < times.length; i++) {
+      const c = closes[i];
+      if (c != null && c > 0) out.push({ t: times[i] * 1000, c });
+    }
+  }
+  return out;
+}
+
+async function indFetchCapital(sym, tf, fromMs, toMs) {
+  if (!capCst || !capToken) throw new Error('Capital.com session not ready');
+  const tfMs  = IND_TF_MS[tf];
+  const epic  = sym === 'XAU' ? 'GOLD' : 'SILVER';
+  const iso   = ms => new Date(ms).toISOString().slice(0, 19);
+  const out   = [];
+  let start   = Math.ceil(fromMs / tfMs) * tfMs;
+  let pages   = 0;
+  while (start <= toMs) {
+    if (++pages > IND_MAX_PAGES) throw new Error('gap too large (pages)');
+    const end = Math.min(toMs, start + 999 * tfMs);
+    const url = `${CAP_REST_URL}/api/v1/prices/${epic}?resolution=${CAP_RESOLUTION[tf]}&max=1000`
+              + `&from=${iso(start)}&to=${iso(end)}`;
+    const res = await fetchJson(url, { headers: { 'CST': capCst, 'X-SECURITY-TOKEN': capToken } });
+    if (!res || !Array.isArray(res.prices)) {
+      throw new Error(`Capital candles bad response: ${JSON.stringify(res).slice(0, 140)}`);
+    }
+    for (const p of res.prices) {
+      const ts = String(p.snapshotTimeUTC || '');
+      const t  = Date.parse(/Z$|[+-]\d\d:?\d\d$/.test(ts) ? ts : ts + 'Z');
+      const c  = parseFloat(p.closePrice?.bid);              // live metal price is the bid too
+      if (Number.isFinite(t) && c > 0 && t >= fromMs) out.push({ t, c });
+    }
+    start = end + tfMs;
+  }
+  return out;
+}
+
+/** Closed candles only (forming candle dropped), ascending, de-duplicated. */
+async function indFetchCandles(sym, tf, fromMs, toMs) {
+  const src = indSource(sym);
+  let raw;
+  if (src === 'gate')         raw = await indFetchGate(sym, tf, fromMs, toMs);
+  else if (src === 'yahoo')   raw = await indFetchYahoo(sym, tf, fromMs, toMs);
+  else if (src === 'capital') raw = await indFetchCapital(sym, tf, fromMs, toMs);
+  else throw new Error(`no candle source for ${sym}`);
+
+  const tfMs = IND_TF_MS[tf];
+  const now  = Date.now();
+  const seen = new Set();
+  return raw
+    .filter(c => c.t + tfMs <= now && !seen.has(c.t) && seen.add(c.t))
+    .sort((a, b) => a.t - b.t);
+}
+
+/** History for the first calculation: ~5 × period closed candles ending now. */
+async function indFetchHistory(sym, tf, need) {
+  const tfMs = IND_TF_MS[tf];
+  const now  = Date.now();
+  if (indSource(sym) === 'yahoo') {
+    // One request. Forex trades ~5/7 of the week; indices only a few hours a day.
+    const calFactor = FOREX_PAIRS.has(sym) ? 1.5 : 5.5;
+    const span = Math.min(need * tfMs * calFactor, YAHOO_MAX_SPAN_MS[tf]);
+    return (await indFetchCandles(sym, tf, now - span, now)).slice(-need);
+  }
+  let out = [];
+  let to  = now;
+  for (let page = 0; page < IND_MAX_PAGES && out.length < need; page++) {
+    const from = to - 999 * tfMs;
+    const part = await indFetchCandles(sym, tf, from, to);
+    out = part.concat(out);
+    to  = from - tfMs;
+  }
+  return out.slice(-need);
+}
+
+// ── group lifecycle ──────────────────────────────────────────────────────────
+
+/** Runs every 5s (pure in-memory): creates states for new alerts, drops unused ones, starts bootstraps. */
+function syncIndicatorStates() {
+  const wanted = new Map(); // key → Set(periods)
+  for (const a of Object.values(activeAlerts)) {
+    if (!indIsValid(a)) continue;
+    const key = indKey(a.pairSymbol, a.timeframe);
+    if (!wanted.has(key)) wanted.set(key, new Set());
+    wanted.get(key).add(indPeriodOf(a));
+  }
+  const now = Date.now();
+
+  for (const [key, periods] of wanted) {
+    let g = indGroups.get(key);
+    if (!g) {
+      const [sym, tf] = key.split('|');
+      g = { key, sym, tf, tfMs: IND_TF_MS[tf], source: indSource(sym), periods: new Map(),
+            lastOpen: 0, ready: false, loading: false, updating: false, dirty: false,
+            fails: 0, nextTryAt: 0 };
+      indGroups.set(key, g);
+      log(`📈 EMA group created: ${key} (${g.source})`);
+    }
+    for (const p of periods) {
+      let st = g.periods.get(p);
+      if (!st) {
+        st = { period: p, k: 2 / (p + 1), ema: 0, ready: false, lastWantedAt: now };
+        g.periods.set(p, st);
+        g.dirty = true;                       // a new period needs (at most) one history reload
+      }
+      st.lastWantedAt = now;
+    }
+    if ((!g.ready || g.dirty) && !g.loading && now >= g.nextTryAt && indBootsRunning < IND_MAX_PARALLEL_BOOTS) {
+      indBootstrapGroup(g).catch(e => warn(`EMA bootstrap crash ${g.key}: ${e.message}`));
+    }
+  }
+
+  // Cleanup — states/groups nobody uses any more
+  for (const [key, g] of indGroups) {
+    for (const [p, st] of g.periods) {
+      if (now - st.lastWantedAt > IND_UNUSED_GRACE_MS) g.periods.delete(p);
+    }
+    if (g.periods.size === 0) { indGroups.delete(key); log(`📈 EMA group removed: ${key}`); }
+  }
+}
+
+async function indBootstrapGroup(g) {
+  g.loading = true;
+  indBootsRunning++;
+  try {
+    const periods = [...g.periods.keys()];
+    const maxP    = Math.max(...periods);
+    const need    = Math.max(maxP * IND_WARMUP_FACTOR, maxP + 50);
+    const candles = await indFetchHistory(g.sym, g.tf, need);
+    if (candles.length === 0) throw new Error('no candles returned');
+
+    const closes = candles.map(c => c.c);
+    const notes  = [];
+    for (const st of g.periods.values()) {
+      if (closes.length < st.period) {
+        st.ready = false;
+        notes.push(`EMA${st.period}: only ${closes.length} candles available — not ready`);
+        continue;
+      }
+      st.ema   = indEmaFromCloses(closes, st.period);
+      st.ready = true;
+      st.warm  = closes.length;
+    }
+    g.lastOpen = candles[candles.length - 1].t;
+    g.lastCandle = candles[candles.length - 1];
+    g.ready = true; g.dirty = false; g.fails = 0;
+    const summary = [...g.periods.values()].map(s => `EMA${s.period}=${s.ready ? s.ema.toFixed(5) : 'n/a'}`).join(' ');
+    log(`📈 EMA bootstrap ${g.key}: ${candles.length} candles (need ${need}) lastOpen=${new Date(g.lastOpen).toISOString()} ${summary}`);
+    notes.forEach(n => warn(`  ${g.key} ${n}`));
+  } catch (e) {
+    g.fails++;
+    g.nextTryAt = Date.now() + Math.min(30000 * Math.pow(2, g.fails - 1), 5 * 60000);
+    warn(`EMA bootstrap failed ${g.key} (attempt ${g.fails}): ${e.message} — retry in ${Math.round((g.nextTryAt - Date.now()) / 1000)}s`);
+    if (g.fails === 5) {
+      sendAlertEmail(`ind_boot_${g.key}`, `EMA history failing for ${g.key}`,
+        `The indicator engine could not load candle history for ${g.key} after 5 attempts.\nLast error: ${e.message}\nEMA alerts on this pair/timeframe cannot trigger until it succeeds.`);
+    }
+  } finally {
+    g.loading = false;
+    indBootsRunning--;
+  }
+  // Candles that closed while history was loading → one small catch-up fetch
+  // (only when a candle really closed since the history snapshot — otherwise it's a wasted request)
+  if (g.ready && g.source !== 'capital' && Date.now() >= g.lastOpen + 2 * g.tfMs) indUpdateGroup(g).catch(() => {});
+}
+
+// ── candle-close updates ─────────────────────────────────────────────────────
+
+function indApplyCandle(g, candle) {
+  for (const st of g.periods.values()) {
+    if (st.ready) st.ema = candle.c * st.k + st.ema * (1 - st.k);
+  }
+  g.lastOpen   = candle.t;
+  g.lastCandle = candle;
+}
+
+/** Gate / Yahoo: fetch only candles newer than the last one we hold, update every period, evaluate. */
+async function indUpdateGroup(g) {
+  if (!g.ready || g.loading || g.updating) return false;
+  g.updating = true;
+  try {
+    const candles = await indFetchCandles(g.sym, g.tf, g.lastOpen + g.tfMs, Date.now());
+    const fresh = candles.filter(c => c.t > g.lastOpen);
+    if (!fresh.length) return false;
+    for (const c of fresh) indApplyCandle(g, c);
+    indEvaluateCandleConfirm(g, g.lastCandle);
+    return true;
+  } catch (e) {
+    warn(`EMA update failed ${g.key}: ${e.message}`);
+    if (/gap too large/.test(e.message)) { g.ready = false; g.nextTryAt = 0; } // too far behind → reload history
+    return false;
+  } finally {
+    g.updating = false;
+  }
+}
+
+/** Metals: same minute-boundary price snapshot the existing candle-close alerts use (no REST per close). */
+function indUpdateMetal(g, boundaryMs) {
+  if (!g.ready || g.loading) return;
+  const expectedOpen = boundaryMs - g.tfMs;
+  if (g.lastOpen >= expectedOpen) return;                 // history already contained this candle
+  const price = metalCloseSnapshot[g.sym]?.[g.tf];
+  if (!(price > 0)) return;
+  indApplyCandle(g, { t: expectedOpen, c: price });
+  indEvaluateCandleConfirm(g, g.lastCandle);
+}
+
+/** Called from the minute-boundary checker (right after the metal snapshots are taken). */
+function onIndicatorBoundary(minNow) {
+  if (!indGroups.size) return;
+  const boundaryMs = minNow * 60000;
+  for (const g of indGroups.values()) {
+    if (!g.ready) continue;
+    // Yahoo hourly bars of indices start at :15/:30, so poll those every 15 min
+    const everyMin = (g.source === 'yahoo' && g.tf === 'H1') ? 15 : g.tfMs / 60000;
+    if (minNow % everyMin !== 0) continue;
+    if (!indMarketOpen(g.sym)) continue;                  // closed market → no requests at all
+    if (g.source === 'capital') { indUpdateMetal(g, boundaryMs); continue; }
+
+    const aligned      = boundaryMs % g.tfMs === 0;
+    const expectedOpen = boundaryMs - g.tfMs;
+    // The data provider may publish the just-closed candle a few seconds late → retry a few times
+    const delays = aligned ? [1500, 5000, 12000, 25000, 45000] : [3000];
+    delays.forEach(d => setTimeout(() => {
+      if (!indGroups.has(g.key)) return;
+      if (aligned && g.lastOpen >= expectedOpen) return;  // already have it
+      indUpdateGroup(g).catch(() => {});
+    }, d + Math.floor(Math.random() * 700)));              // jitter so groups don't hit APIs at the same instant
+  }
+}
+
+// ── hit evaluation ───────────────────────────────────────────────────────────
+
+/** Which side of the EMA the alert started on. Persisted in RTDB as `lastSide` so restarts don't flip it. */
+function indEnsureBaseline(alert, ema) {
+  if (alert._emaSide) return true;
+  if (alert.lastSide === 'above' || alert.lastSide === 'below') {
+    alert._emaSide = alert.lastSide;
+    return true;
+  }
+  const p = parseFloat(alert.priceAtCreation) || livePrice[alert.pairSymbol] || 0;
+  if (!(p > 0)) return false;
+  alert._emaSide = p >= ema ? 'above' : 'below';
+  alert.lastSide = alert._emaSide;
+  // Child-path write: SSE ignores 3-level paths, so this never disturbs the alert cache.
+  if (activeAlerts[alert.id]) {
+    rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, alert._emaSide)
+      .catch(e => warn(`  EMA baseline persist failed ${alert.id}: ${e.message}`));
+  }
+  log(`  📈 EMA alert ${alert.id} baseline: price ${p} is ${alert._emaSide} EMA${indPeriodOf(alert)} ${ema.toFixed(5)}`);
+  return true;
+}
+
+function indShouldSkip(alert) {
+  const mode = alert.alertMode === 'repeating' ? 'repeating' : 'once';
+  if (mode === 'once' && recentlyTriggered.has(alert.id)) return true;
+  if (alert.enabled === false) return true;                              // paused by the user
+  if (serverStopped && alert.userEmail !== DEV_EMAIL) return true;
+  return false;
+}
+
+/** Common fire path for Touch + Candle Confirmation. */
+function indFire(alert, hitPrice, emaValue, hitSide, kindLabel) {
+  const repeating = alert.alertMode === 'repeating';
+  alert._emaSide = hitSide;                                              // price is now on this side of the EMA
+
+  if (repeating) {
+    const cooldownMs = Math.max(1, parseInt(alert.cooldownMinutes, 10) || 5) * 60000;
+    const now = Date.now();
+    if (now - (alert.lastTriggeredAt || 0) < cooldownMs) {
+      log(`  🔁 EMA alert ${alert.id} ${kindLabel} (${hitSide}) but in cooldown — crossing consumed`);
+      return;
+    }
+    log(`🎯🔁 EMA repeating alert triggered: ${alert.pairSymbol} ${kindLabel} EMA${indPeriodOf(alert)} ${alert.timeframe} → ${hitSide} (ema=${emaValue} price=${hitPrice}) user=${alert.userId}`);
+    processRepeatingTrigger(alert, hitPrice, hitSide, emaValue)
+      .catch(e => err(`processRepeatingTrigger (EMA) error: ${e.message}`));
+    return;
+  }
+
+  if (recentlyTriggered.has(alert.id)) return;
+  recentlyTriggered.add(alert.id);
+  log(`🎯 EMA alert triggered: ${alert.pairSymbol} ${kindLabel} EMA${indPeriodOf(alert)} ${alert.timeframe} → ${hitSide} (ema=${emaValue} price=${hitPrice}) user=${alert.userId}`);
+  // The alert is removed right after this, so it's safe to stamp the EMA level + side on it:
+  // history card, FCM and admin log then show "EMA value hit" and the side it crossed to.
+  alert.targetPrice = emaValue;
+  alert.direction   = hitSide;
+  processTriggeredAlert(alert, hitPrice).catch(e => {
+    err(`processTriggeredAlert (EMA) error: ${e.message}`);
+    recentlyTriggered.delete(alert.id);
+  });
+}
+
+/** TOUCH — every second, zero network. */
+function checkIndicatorTouchAlerts() {
+  if (!indGroups.size) return;
+  for (const alert of Object.values(activeAlerts)) {
+    try {
+      if (alert.candleClose || !indIsValid(alert)) continue;
+      if (indShouldSkip(alert)) continue;
+      const g  = indGroups.get(indKey(alert.pairSymbol, alert.timeframe));
+      const st = g && g.periods.get(indPeriodOf(alert));
+      if (!st || !st.ready || !g.ready) continue;
+      if (!indMarketOpen(alert.pairSymbol)) continue;                    // stale weekend price — same rule as price alerts
+      const price = livePrice[alert.pairSymbol];
+      if (!(price > 0)) continue;
+      const e = st.ema;
+      if (!indEnsureBaseline(alert, e)) continue;
+
+      let hitSide = null;
+      if (alert._emaSide === 'below') {
+        if (price > e || (price === e && !alert._emaWait)) hitSide = 'above';
+        else if (price < e) alert._emaWait = false;
+      } else {
+        if (price < e || (price === e && !alert._emaWait)) hitSide = 'below';
+        else if (price > e) alert._emaWait = false;
+      }
+      if (!hitSide) continue;
+      alert._emaWait = (price === e);   // exactly on the line right after firing → wait until price leaves it
+      indFire(alert, price, e, hitSide, 'Touch');
+    } catch (e) { warn(`checkIndicatorTouchAlerts error: ${e.message}`); }
+  }
+}
+
+/** CANDLE CONFIRMATION — right after the EMA has been updated with a freshly closed candle. */
+function indEvaluateCandleConfirm(g, candle) {
+  if (!candle) return;
+  for (const alert of Object.values(activeAlerts)) {
+    try {
+      if (!alert.candleClose || !indIsValid(alert)) continue;
+      if (alert.pairSymbol !== g.sym || alert.timeframe !== g.tf) continue;
+      if (indShouldSkip(alert)) continue;
+      const st = g.periods.get(indPeriodOf(alert));
+      if (!st || !st.ready) continue;
+      const e = st.ema;                                                  // EMA including this closed candle
+      if (!indEnsureBaseline(alert, e)) continue;
+
+      let hitSide = null;
+      if (alert._emaSide === 'below' && candle.c > e) hitSide = 'above';
+      else if (alert._emaSide === 'above' && candle.c < e) hitSide = 'below';
+      if (!hitSide) continue;
+      indFire(alert, candle.c, e, hitSide, 'Candle Confirmation');
+    } catch (e) { warn(`indEvaluateCandleConfirm error: ${e.message}`); }
+  }
+}
+
+/** Snapshot for the secret-gated /admin/indicators endpoint (verify EMA values against TradingView). */
+function indDebugSnapshot() {
+  const groups = [];
+  for (const g of indGroups.values()) {
+    groups.push({
+      key: g.key, source: g.source, ready: g.ready, loading: g.loading, fails: g.fails,
+      lastOpen: g.lastOpen ? new Date(g.lastOpen).toISOString() : null,
+      lastClose: g.lastCandle ? g.lastCandle.c : null,
+      livePrice: livePrice[g.sym] || 0,
+      periods: [...g.periods.values()].map(s => ({ period: s.period, ready: s.ready, ema: s.ready ? s.ema : null, candlesUsed: s.warm || 0 })),
+      alerts: Object.values(activeAlerts).filter(a => indIsValid(a) && a.pairSymbol === g.sym && a.timeframe === g.tf).length,
+    });
+  }
+  return { groups, unsupportedAlerts: Object.values(activeAlerts).filter(a => a.alertKind === 'indicator' && !indIsValid(a)).length };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2208,6 +2753,9 @@ async function main() {
 
   // Check instant alerts every second
   setInterval(checkAlerts, 1000);
+
+  // EMA indicator engine: create/drop states + load history when EMA alerts appear (in-memory scan, no network)
+  setInterval(() => { try { syncIndicatorStates(); } catch (e) { warn(`syncIndicatorStates error: ${e.message}`); } }, 5000);
 
   // Minute-boundary candle close checker
   startMinuteBoundaryChecker();
