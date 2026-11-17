@@ -332,6 +332,24 @@ async function rtdbDelete(path) {
   return fetchJson(url, { method: 'DELETE' });
 }
 
+/**
+ * Ghost-node guard. A server write to alerts/{uid}/{id} (a child like lastSide, or the whole alert)
+ * can land AFTER the user deleted that alert from the app and re-create the node in RTDB while it is
+ * gone from Firestore. Call this right after such a write: if the alert is no longer in our live
+ * cache (the app deleted it) the node is removed again. Never throws.
+ */
+async function rtdbRemoveIfDeleted(userId, alertId) {
+  try {
+    if (activeAlerts[alertId]) return false;                 // still a live alert → keep
+    await rtdbDelete(`alerts/${userId}/${alertId}`);
+    log(`🧹 Removed ghost RTDB node (alert deleted during a server write): alerts/${userId}/${alertId}`);
+    return true;
+  } catch (e) {
+    warn(`rtdbRemoveIfDeleted failed for ${alertId}: ${e.message}`);
+    return false;
+  }
+}
+
 // ── Bulletproof write helper for the trigger-processing pipeline ───────────
 // attemptFn does a write AND reads the value back from the server to confirm
 // it actually landed (not just that the HTTP call didn't throw) — same idea
@@ -1835,6 +1853,7 @@ async function processRepeatingTrigger(alert, hitPrice, crossSide, hitTarget) {
   const rtdbOk = await withVerifiedRetry(`RTDB update (${alertId})`, async () => {
     const { _lastSide, _justReenabled, _emaSide, _emaWait, userId: _uid, ...persistable } = alert;
     await rtdbSet(`alerts/${userId}/${alertId}`, persistable);
+    if (await rtdbRemoveIfDeleted(userId, alertId)) return true;   // user deleted it meanwhile → don't resurrect
     const check = await rtdbGet(`alerts/${userId}/${alertId}`);
     return !!check && check.lastTriggeredAt === hitTime && check.triggeredCount === newCount;
   });
@@ -2005,7 +2024,7 @@ async function sendFCM(userId, alert, hitPrice) {
   const isAlarm  = alert.alarm === true;
   const isIndicator = alert.alertKind === 'indicator';
   const hitType  = isIndicator
-    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · ${alert.indicatorMode === 'crossover' ? `EMA ${alert.indicatorPeriod} × EMA ${alert.indicatorPeriod2} Cross` : `EMA ${alert.indicatorPeriod}`} · ${alert.timeframe}`
+    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · ${alert.indicatorMode === 'crossover' ? `${String(alert.indicatorType || 'ema').toUpperCase()} ${alert.indicatorPeriod} × ${alert.indicatorPeriod2} Cross` : `${String(alert.indicatorType || 'ema').toUpperCase()} ${alert.indicatorPeriod}`} · ${alert.timeframe}`
     : (alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit');
   const priceStr = formatPrice(hitPrice, alert.pairSymbol);
   const dirLabel = alert.direction === 'above' ? '📈 Above' : '📉 Below';
@@ -2285,16 +2304,19 @@ function indPeriod2Of(a) {
   return Number.isFinite(p) ? p : 0;
 }
 function indIsCross(a) { return a.indicatorMode === 'crossover'; }
+function indTypeOf(a) { return IND_TYPES.has(a.indicatorType) ? a.indicatorType : 'ema'; }
+/** State keys (type:period) this alert needs. */
+function indKeysOf(a) { return indPeriodsOf(a).map(p => indStateKey(a.indicatorType, p)); }
 /** Every EMA period this alert needs. */
 function indPeriodsOf(a) { return indIsCross(a) ? [indPeriodOf(a), indPeriod2Of(a)] : [indPeriodOf(a)]; }
 /** Short label for logs, e.g. "EMA50" or "EMA9×EMA21". */
-function indLabel(a) { return indIsCross(a) ? `EMA${indPeriodOf(a)}×EMA${indPeriod2Of(a)}` : `EMA${indPeriodOf(a)}`; }
+function indLabel(a) { const T = String(a.indicatorType || 'ema').toUpperCase(); return indIsCross(a) ? `${T}${indPeriodOf(a)}×${T}${indPeriod2Of(a)}` : `${T}${indPeriodOf(a)}`; }
 /** Signature of the indicator setup — if it changes (edit), the stored side must be forgotten. */
-function indSetupSig(a) { return `${a.indicatorMode}|${indPeriodOf(a)}|${indIsCross(a) ? indPeriod2Of(a) : 0}|${a.timeframe}|${a.candleClose ? 1 : 0}`; }
+function indSetupSig(a) { return `${a.indicatorType}|${a.indicatorMode}|${indPeriodOf(a)}|${indIsCross(a) ? indPeriod2Of(a) : 0}|${a.timeframe}|${a.candleClose ? 1 : 0}`; }
 
 /** True when this alert is an EMA alert (single or crossover) this engine can monitor. */
 function indIsValid(a) {
-  if (!a || a.alertKind !== 'indicator' || a.indicatorType !== 'ema') return false;
+  if (!a || a.alertKind !== 'indicator' || !IND_TYPES.has(a.indicatorType)) return false;
   if (a.indicatorMode !== 'single' && a.indicatorMode !== 'crossover') return false;
   if (!IND_TF_MS[a.timeframe] || !indSource(a.pairSymbol)) return false;
   const ps = indPeriodsOf(a);
@@ -2318,6 +2340,83 @@ function indEmaFromCloses(closes, period) {
   ema /= period;                                   // seed = SMA of the first N closes
   for (let i = period; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
   return ema;
+}
+
+// ── indicator math ───────────────────────────────────────────────────────────
+// Every state keeps:  val   = indicator value on the last CLOSED candle (candle-confirmation, display)
+//                     level = price at which "price == live indicator" (Touch: price vs level has the
+//                             same sign as price vs the live, forming-candle indicator value)
+//   EMA : level = ema                       (price − liveEMA = (1−k)(price − ema))
+//   SMA : level = (sum − oldest)/(N−1)      (price − liveSMA = (N−1)/N · (price − level))
+//   DEMA: level = ((2−k)e1 − e2)/(1−k)      (price − liveDEMA = (1−k)² · (price − level))
+
+const IND_TYPES = new Set(['ema', 'sma', 'dema']);
+const indStateKey = (type, p) => `${type}:${p}`;
+
+/** Closed candles needed for the first calculation (EMA/DEMA converge, SMA is exact). */
+function indNeedFor(type, p) {
+  if (type === 'sma')  return p + 2;
+  if (type === 'dema') return Math.max(p * 6, p * 2 + 50);
+  return Math.max(p * IND_WARMUP_FACTOR, p + 50);
+}
+/** Fewest candles that give any value at all. */
+function indMinFor(type, p) { return type === 'dema' ? 2 * p - 1 : p; }
+
+function indRefreshLevel(st) {
+  if (st.type === 'sma') {
+    st.val   = st.sum / st.period;
+    st.level = (st.sum - st.buf[0]) / (st.period - 1);
+  } else if (st.type === 'dema') {
+    st.val   = 2 * st.e1 - st.e2;
+    st.level = ((2 - st.k) * st.e1 - st.e2) / (1 - st.k);
+  } else {
+    st.val = st.level = st.e1;
+  }
+}
+
+/** Builds the state values from ascending closes. Caller guarantees closes.length >= indMinFor(). */
+function indInitState(st, closes) {
+  const n = st.period, k = st.k;
+  if (st.type === 'sma') {
+    st.buf = closes.slice(-n);
+    st.sum = st.buf.reduce((a, b) => a + b, 0);
+  } else if (st.type === 'dema') {
+    let e1 = 0; for (let i = 0; i < n; i++) e1 += closes[i]; e1 /= n;         // e1 seed = SMA of first N closes
+    const e1s = [e1];
+    for (let i = n; i < closes.length; i++) { e1 = closes[i] * k + e1 * (1 - k); e1s.push(e1); }
+    let e2 = 0; for (let i = 0; i < n; i++) e2 += e1s[i]; e2 /= n;             // e2 seed = SMA of first N e1 values
+    for (let i = n; i < e1s.length; i++) e2 = e1s[i] * k + e2 * (1 - k);
+    st.e1 = e1; st.e2 = e2;
+  } else {
+    st.e1 = indEmaFromCloses(closes, n);
+  }
+  indRefreshLevel(st);
+}
+
+/** One more closed candle. */
+function indStepState(st, c) {
+  if (st.type === 'sma') {
+    st.buf.push(c);
+    if (st.buf.length > st.period) st.buf.shift();
+    st.sum = st.buf.reduce((x, y) => x + y, 0);          // recomputed (N ≤ 500) → no float drift
+  } else if (st.type === 'dema') {
+    st.e1 = c * st.k + st.e1 * (1 - st.k);
+    st.e2 = st.e1 * st.k + st.e2 * (1 - st.k);
+  } else {
+    st.e1 = c * st.k + st.e1 * (1 - st.k);
+  }
+  indRefreshLevel(st);
+}
+
+/** Indicator value if the forming candle closed at `price` right now (live, like TradingView). Zero network. */
+function indLiveValue(st, price) {
+  if (st.type === 'sma')  return (st.sum - st.buf[0] + price) / st.period;
+  if (st.type === 'dema') {
+    const e1 = price * st.k + st.e1 * (1 - st.k);
+    const e2 = e1 * st.k + st.e2 * (1 - st.k);
+    return 2 * e1 - e2;
+  }
+  return price * st.k + st.e1 * (1 - st.k);
 }
 
 // ── candle fetchers (each returns ascending [{t: openTimeMs, c: close}], may include forming candle) ──
@@ -2443,7 +2542,7 @@ function syncIndicatorStates() {
     if (!indIsValid(a)) continue;
     const key = indKey(a.pairSymbol, a.timeframe);
     if (!wanted.has(key)) wanted.set(key, new Set());
-    for (const p of indPeriodsOf(a)) wanted.get(key).add(p);
+    for (const k of indKeysOf(a)) wanted.get(key).add(k);
   }
   const now = Date.now();
 
@@ -2457,11 +2556,12 @@ function syncIndicatorStates() {
       indGroups.set(key, g);
       log(`📈 EMA group created: ${key} (${g.source})`);
     }
-    for (const p of periods) {
-      let st = g.periods.get(p);
+    for (const sk of periods) {
+      let st = g.periods.get(sk);
       if (!st) {
-        st = { period: p, k: 2 / (p + 1), ema: 0, ready: false, lastWantedAt: now };
-        g.periods.set(p, st);
+        const [type, ps] = sk.split(':'); const p = parseInt(ps, 10);
+        st = { type, period: p, k: 2 / (p + 1), val: 0, level: 0, ready: false, lastWantedAt: now };
+        g.periods.set(sk, st);
         g.dirty = true;                       // a new period needs (at most) one history reload
       }
       st.lastWantedAt = now;
@@ -2473,8 +2573,8 @@ function syncIndicatorStates() {
 
   // Cleanup — states/groups nobody uses any more
   for (const [key, g] of indGroups) {
-    for (const [p, st] of g.periods) {
-      if (now - st.lastWantedAt > IND_UNUSED_GRACE_MS) g.periods.delete(p);
+    for (const [sk, st] of g.periods) {
+      if (now - st.lastWantedAt > IND_UNUSED_GRACE_MS) g.periods.delete(sk);
     }
     if (g.periods.size === 0) { indGroups.delete(key); log(`📈 EMA group removed: ${key}`); }
   }
@@ -2484,28 +2584,26 @@ async function indBootstrapGroup(g) {
   g.loading = true;
   indBootsRunning++;
   try {
-    const periods = [...g.periods.keys()];
-    const maxP    = Math.max(...periods);
-    const need    = Math.max(maxP * IND_WARMUP_FACTOR, maxP + 50);
+    const need = Math.max(...[...g.periods.values()].map(st => indNeedFor(st.type, st.period)));
     const candles = await indFetchHistory(g.sym, g.tf, need);
     if (candles.length === 0) throw new Error('no candles returned');
 
     const closes = candles.map(c => c.c);
     const notes  = [];
     for (const st of g.periods.values()) {
-      if (closes.length < st.period) {
+      if (closes.length < indMinFor(st.type, st.period)) {
         st.ready = false;
-        notes.push(`EMA${st.period}: only ${closes.length} candles available — not ready`);
+        notes.push(`${st.type.toUpperCase()}${st.period}: only ${closes.length} candles available — not ready`);
         continue;
       }
-      st.ema   = indEmaFromCloses(closes, st.period);
+      indInitState(st, closes);
       st.ready = true;
       st.warm  = closes.length;
     }
     g.lastOpen = candles[candles.length - 1].t;
     g.lastCandle = candles[candles.length - 1];
     g.ready = true; g.dirty = false; g.fails = 0;
-    const summary = [...g.periods.values()].map(s => `EMA${s.period}=${s.ready ? s.ema.toFixed(5) : 'n/a'}`).join(' ');
+    const summary = [...g.periods.values()].map(s => `${s.type.toUpperCase()}${s.period}=${s.ready ? s.val.toFixed(5) : 'n/a'}`).join(' ');
     log(`📈 EMA bootstrap ${g.key}: ${candles.length} candles (need ${need}) lastOpen=${new Date(g.lastOpen).toISOString()} ${summary}`);
     notes.forEach(n => warn(`  ${g.key} ${n}`));
   } catch (e) {
@@ -2529,7 +2627,7 @@ async function indBootstrapGroup(g) {
 
 function indApplyCandle(g, candle) {
   for (const st of g.periods.values()) {
-    if (st.ready) st.ema = candle.c * st.k + st.ema * (1 - st.k);
+    if (st.ready) indStepState(st, candle.c);
   }
   g.lastOpen   = candle.t;
   g.lastCandle = candle;
@@ -2606,6 +2704,7 @@ function indEnsureBaseline(alert, ema) {
   // Child-path write: SSE ignores 3-level paths, so this never disturbs the alert cache.
   if (activeAlerts[alert.id]) {
     rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, alert._emaSide)
+      .then(() => rtdbRemoveIfDeleted(alert.userId, alert.id))
       .catch(e => warn(`  EMA baseline persist failed ${alert.id}: ${e.message}`));
   }
   log(`  📈 EMA alert ${alert.id} baseline: price ${p} is ${alert._emaSide} EMA${indPeriodOf(alert)} ${ema.toFixed(5)}`);
@@ -2632,7 +2731,8 @@ function indFire(alert, hitPrice, emaValue, hitSide, kindLabel) {
       log(`  🔁 EMA alert ${alert.id} ${kindLabel} (${hitSide}) but in cooldown — crossing consumed`);
       alert.lastSide = hitSide;                                          // keep RTDB in step so a restart can't replay it
       if (activeAlerts[alert.id]) {
-        rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, hitSide).catch(() => {});
+        rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, hitSide)
+          .then(() => rtdbRemoveIfDeleted(alert.userId, alert.id)).catch(() => {});
       }
       return;
     }
@@ -2668,6 +2768,7 @@ function indEnsureCrossBaseline(alert, diff) {
   alert.lastSide = alert._emaSide;
   if (activeAlerts[alert.id]) {
     rtdbSet(`alerts/${alert.userId}/${alert.id}/lastSide`, alert._emaSide)
+      .then(() => rtdbRemoveIfDeleted(alert.userId, alert.id))
       .catch(e => warn(`  EMA cross baseline persist failed ${alert.id}: ${e.message}`));
   }
   log(`  📈 EMA cross alert ${alert.id} baseline: ${indLabel(alert)} → EMA${indPeriodOf(alert)} is ${alert._emaSide} EMA${indPeriod2Of(alert)}`);
@@ -2683,10 +2784,11 @@ function indCrossHit(alert, diff) {
 
 /** Crossover TOUCH: both EMAs as they would be with the live price in the forming candle. Zero network. */
 function indTouchCross(alert, g, price) {
-  const s1 = g.periods.get(indPeriodOf(alert)), s2 = g.periods.get(indPeriod2Of(alert));
+  const [k1, k2] = indKeysOf(alert);
+  const s1 = g.periods.get(k1), s2 = g.periods.get(k2);
   if (!s1 || !s2 || !s1.ready || !s2.ready) return;
-  const l1 = price * s1.k + s1.ema * (1 - s1.k);
-  const l2 = price * s2.k + s2.ema * (1 - s2.k);
+  const l1 = indLiveValue(s1, price);
+  const l2 = indLiveValue(s2, price);
   const diff = l1 - l2;
   if (!indEnsureCrossBaseline(alert, diff)) return;
   const hitSide = indCrossHit(alert, diff);
@@ -2696,13 +2798,14 @@ function indTouchCross(alert, g, price) {
 
 /** Crossover CANDLE CONFIRMATION: EMAs already include the freshly closed candle. */
 function indCandleCross(alert, g, candle) {
-  const s1 = g.periods.get(indPeriodOf(alert)), s2 = g.periods.get(indPeriod2Of(alert));
+  const [k1, k2] = indKeysOf(alert);
+  const s1 = g.periods.get(k1), s2 = g.periods.get(k2);
   if (!s1 || !s2 || !s1.ready || !s2.ready) return;
-  const diff = s1.ema - s2.ema;
+  const diff = s1.val - s2.val;
   if (!indEnsureCrossBaseline(alert, diff)) return;
   const hitSide = indCrossHit(alert, diff);
   if (!hitSide) return;
-  indFire(alert, candle.c, (s1.ema + s2.ema) / 2, hitSide, 'Candle Confirmation');
+  indFire(alert, candle.c, (s1.val + s2.val) / 2, hitSide, 'Candle Confirmation');
 }
 
 /** TOUCH — every second, zero network. */
@@ -2719,12 +2822,12 @@ function checkIndicatorTouchAlerts() {
         if (px > 0) indTouchCross(alert, g, px);
         continue;
       }
-      const st = g && g.periods.get(indPeriodOf(alert));
+      const st = g && g.periods.get(indKeysOf(alert)[0]);
       if (!st || !st.ready || !g.ready) continue;
       if (!indMarketOpen(alert.pairSymbol)) continue;                    // stale weekend price — same rule as price alerts
       const price = livePrice[alert.pairSymbol];
       if (!(price > 0)) continue;
-      const e = st.ema;
+      const e = st.level;                                                // price == live indicator ⇔ price == level
       if (!indEnsureBaseline(alert, e)) continue;
 
       let hitSide = null;
@@ -2737,7 +2840,7 @@ function checkIndicatorTouchAlerts() {
       }
       if (!hitSide) continue;
       alert._emaWait = (price === e);   // exactly on the line right after firing → wait until price leaves it
-      indFire(alert, price, e, hitSide, 'Touch');
+      indFire(alert, price, st.val, hitSide, 'Touch');
     } catch (e) { warn(`checkIndicatorTouchAlerts error: ${e.message}`); }
   }
 }
@@ -2751,9 +2854,9 @@ function indEvaluateCandleConfirm(g, candle) {
       if (alert.pairSymbol !== g.sym || alert.timeframe !== g.tf) continue;
       if (indShouldSkip(alert)) continue;
       if (indIsCross(alert)) { indCandleCross(alert, g, candle); continue; }
-      const st = g.periods.get(indPeriodOf(alert));
+      const st = g.periods.get(indKeysOf(alert)[0]);
       if (!st || !st.ready) continue;
-      const e = st.ema;                                                  // EMA including this closed candle
+      const e = st.val;                                                  // indicator value including this closed candle
       if (!indEnsureBaseline(alert, e)) continue;
 
       let hitSide = null;
@@ -2774,7 +2877,7 @@ function indDebugSnapshot() {
       lastOpen: g.lastOpen ? new Date(g.lastOpen).toISOString() : null,
       lastClose: g.lastCandle ? g.lastCandle.c : null,
       livePrice: livePrice[g.sym] || 0,
-      periods: [...g.periods.values()].map(s => ({ period: s.period, ready: s.ready, ema: s.ready ? s.ema : null, candlesUsed: s.warm || 0 })),
+      periods: [...g.periods.values()].map(s => ({ type: s.type, period: s.period, ready: s.ready, value: s.ready ? s.val : null, candlesUsed: s.warm || 0 })),
       alerts: Object.values(activeAlerts).filter(a => indIsValid(a) && a.pairSymbol === g.sym && a.timeframe === g.tf).length,
     });
   }
