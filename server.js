@@ -2024,7 +2024,7 @@ async function sendFCM(userId, alert, hitPrice) {
   const isAlarm  = alert.alarm === true;
   const isIndicator = alert.alertKind === 'indicator';
   const hitType  = isIndicator
-    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · ${alert.indicatorMode === 'crossover' ? `${String(alert.indicatorType || 'ema').toUpperCase()} ${alert.indicatorPeriod} × ${alert.indicatorPeriod2} Cross` : `${String(alert.indicatorType || 'ema').toUpperCase()} ${alert.indicatorPeriod}`} · ${alert.timeframe}`
+    ? `${alert.candleClose ? 'Candle Confirmation' : 'Touch'} · ${alert.indicatorType === 'rsi' ? `RSI ${alert.indicatorPeriod} = ${alert.indicatorTarget}` : alert.indicatorMode === 'crossover' ? `${String(alert.indicatorType || 'ema').toUpperCase()} ${alert.indicatorPeriod} × ${alert.indicatorPeriod2} Cross` : `${String(alert.indicatorType || 'ema').toUpperCase()} ${alert.indicatorPeriod}`} · ${alert.timeframe}`
     : (alert.candleClose ? `Candle Close · ${alert.timeframe}` : 'Instant Hit');
   const priceStr = formatPrice(hitPrice, alert.pairSymbol);
   const dirLabel = alert.direction === 'above' ? '📈 Above' : '📉 Below';
@@ -2066,6 +2066,7 @@ async function sendFCM(userId, alert, hitPrice) {
         indicatorMode:   String(alert.indicatorMode || ''),
         indicatorPeriod: String(alert.indicatorPeriod || 0),
         indicatorPeriod2: String(alert.indicatorPeriod2 || 0),
+        indicatorTarget: String(alert.indicatorTarget || 0),
         timeframe:       String(alert.timeframe || ''),
         layout:          layoutId,
         layoutName:      layoutName,
@@ -2183,6 +2184,7 @@ function startHealthServer() {
         indicatorMode:   a.indicatorMode || '',
         indicatorPeriod: a.indicatorPeriod || 0,
         indicatorPeriod2: a.indicatorPeriod2 || 0,
+        indicatorTarget: a.indicatorTarget || 0,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ total: list.length, alerts: list, updatedAt: Date.now() }));
@@ -2304,6 +2306,7 @@ function indPeriod2Of(a) {
   return Number.isFinite(p) ? p : 0;
 }
 function indIsCross(a) { return a.indicatorMode === 'crossover'; }
+function indTargetOf(a) { const t = parseFloat(a.indicatorTarget); return Number.isFinite(t) ? t : 0; }
 function indTypeOf(a) { return IND_TYPES.has(a.indicatorType) ? a.indicatorType : 'ema'; }
 /** State keys (type:period) this alert needs. */
 function indKeysOf(a) { return indPeriodsOf(a).map(p => indStateKey(a.indicatorType, p)); }
@@ -2312,13 +2315,18 @@ function indPeriodsOf(a) { return indIsCross(a) ? [indPeriodOf(a), indPeriod2Of(
 /** Short label for logs, e.g. "EMA50" or "EMA9×EMA21". */
 function indLabel(a) { const T = String(a.indicatorType || 'ema').toUpperCase(); return indIsCross(a) ? `${T}${indPeriodOf(a)}×${T}${indPeriod2Of(a)}` : `${T}${indPeriodOf(a)}`; }
 /** Signature of the indicator setup — if it changes (edit), the stored side must be forgotten. */
-function indSetupSig(a) { return `${a.indicatorType}|${a.indicatorMode}|${indPeriodOf(a)}|${indIsCross(a) ? indPeriod2Of(a) : 0}|${a.timeframe}|${a.candleClose ? 1 : 0}`; }
+function indSetupSig(a) { return `${a.indicatorType}|${a.indicatorMode}|${indTargetOf(a)}|${indPeriodOf(a)}|${indIsCross(a) ? indPeriod2Of(a) : 0}|${a.timeframe}|${a.candleClose ? 1 : 0}`; }
 
 /** True when this alert is an EMA alert (single or crossover) this engine can monitor. */
 function indIsValid(a) {
   if (!a || a.alertKind !== 'indicator' || !IND_TYPES.has(a.indicatorType)) return false;
   if (a.indicatorMode !== 'single' && a.indicatorMode !== 'crossover') return false;
   if (!IND_TF_MS[a.timeframe] || !indSource(a.pairSymbol)) return false;
+  if (a.indicatorType === 'rsi') {                                         // RSI: single line, length 2–100, target 1–100, Touch only
+    const n = indPeriodOf(a), t = indTargetOf(a);
+    return a.indicatorMode === 'single' && !a.candleClose
+        && n >= IND_RSI_MIN_LEN && n <= IND_RSI_MAX_LEN && t >= 1 && t <= 100;
+  }
   const ps = indPeriodsOf(a);
   if (!ps.every(p => p >= IND_MIN_PERIOD && p <= IND_MAX_PERIOD)) return false;
   if (indIsCross(a) && ps[0] === ps[1]) return false;                    // two identical EMAs can never cross
@@ -2350,20 +2358,48 @@ function indEmaFromCloses(closes, period) {
 //   SMA : level = (sum − oldest)/(N−1)      (price − liveSMA = (N−1)/N · (price − level))
 //   DEMA: level = ((2−k)e1 − e2)/(1−k)      (price − liveDEMA = (1−k)² · (price − level))
 
-const IND_TYPES = new Set(['ema', 'sma', 'dema']);
+const IND_TYPES = new Set(['ema', 'sma', 'dema', 'rsi']);
+const IND_RSI_MIN_LEN = 2, IND_RSI_MAX_LEN = 100;   // RSI length range (target range is 1–100)
 const indStateKey = (type, p) => `${type}:${p}`;
 
 /** Closed candles needed for the first calculation (EMA/DEMA converge, SMA is exact). */
 function indNeedFor(type, p) {
   if (type === 'sma')  return p + 2;
   if (type === 'dema') return Math.max(p * 6, p * 2 + 50);
+  if (type === 'rsi')  return Math.max(p * 14, p + 100);        // Wilder smoothing: (1−1/N)^k decays slowly
   return Math.max(p * IND_WARMUP_FACTOR, p + 50);
 }
 /** Fewest candles that give any value at all. */
-function indMinFor(type, p) { return type === 'dema' ? 2 * p - 1 : p; }
+function indMinFor(type, p) { return type === 'dema' ? 2 * p - 1 : (type === 'rsi' ? p + 1 : p); }
+
+/** Wilder RSI from average gain / loss (same edge rules as TradingView ta.rsi). */
+function indRsiFrom(ag, al) {
+  if (al === 0) return 100;
+  if (ag === 0) return 0;
+  return 100 - 100 / (1 + ag / al);
+}
+
+/**
+ * RSI "Touch" level: the price at which the LIVE RSI (forming candle) equals `target`.
+ * Live RSI rises monotonically with price, so  RSI(price) >= target  ⇔  price >= level.
+ * That lets RSI reuse the exact same price-vs-level Touch logic as every other indicator
+ * (zero network, O(1) per second). Derivation: RS = T/(100−T); with change ch = price − lastClose
+ *   ch >= 0 :  ag' = (ag(N−1)+ch)/N, al' = al(N−1)/N   →  ch = (N−1)(RS·al − ag)
+ *   ch <  0 :  ag' = ag(N−1)/N, al' = (al(N−1)−ch)/N   →  ch = (N−1)(al − ag/RS)
+ */
+function indRsiLevel(st, target) {
+  const T  = Math.min(Math.max(target, 0.0001), 99.9999);   // 100 would need RS = ∞
+  const RS = T / (100 - T), N = st.period;
+  const ch = (RS * st.al >= st.ag) ? (N - 1) * (RS * st.al - st.ag)
+                                   : (N - 1) * (st.al - st.ag / RS);
+  return st.lc + ch;
+}
 
 function indRefreshLevel(st) {
-  if (st.type === 'sma') {
+  if (st.type === 'rsi') {
+    st.val = indRsiFrom(st.ag, st.al);
+    st.level = NaN;                                   // per-alert (depends on the alert's target) → indRsiLevel()
+  } else if (st.type === 'sma') {
     st.val   = st.sum / st.period;
     st.level = (st.sum - st.buf[0]) / (st.period - 1);
   } else if (st.type === 'dema') {
@@ -2377,7 +2413,17 @@ function indRefreshLevel(st) {
 /** Builds the state values from ascending closes. Caller guarantees closes.length >= indMinFor(). */
 function indInitState(st, closes) {
   const n = st.period, k = st.k;
-  if (st.type === 'sma') {
+  if (st.type === 'rsi') {
+    let ag = 0, al = 0;
+    for (let i = 1; i <= n; i++) { const d = closes[i] - closes[i - 1]; if (d > 0) ag += d; else al -= d; }
+    ag /= n; al /= n;                                                          // seed = simple average of first N changes
+    for (let i = n + 1; i < closes.length; i++) {
+      const d = closes[i] - closes[i - 1];
+      ag = (ag * (n - 1) + (d > 0 ? d : 0)) / n;
+      al = (al * (n - 1) + (d < 0 ? -d : 0)) / n;
+    }
+    st.ag = ag; st.al = al; st.lc = closes[closes.length - 1];
+  } else if (st.type === 'sma') {
     st.buf = closes.slice(-n);
     st.sum = st.buf.reduce((a, b) => a + b, 0);
   } else if (st.type === 'dema') {
@@ -2395,7 +2441,12 @@ function indInitState(st, closes) {
 
 /** One more closed candle. */
 function indStepState(st, c) {
-  if (st.type === 'sma') {
+  if (st.type === 'rsi') {
+    const d = c - st.lc;
+    st.ag = (st.ag * (st.period - 1) + (d > 0 ? d : 0)) / st.period;
+    st.al = (st.al * (st.period - 1) + (d < 0 ? -d : 0)) / st.period;
+    st.lc = c;
+  } else if (st.type === 'sma') {
     st.buf.push(c);
     if (st.buf.length > st.period) st.buf.shift();
     st.sum = st.buf.reduce((x, y) => x + y, 0);          // recomputed (N ≤ 500) → no float drift
@@ -2410,6 +2461,11 @@ function indStepState(st, c) {
 
 /** Indicator value if the forming candle closed at `price` right now (live, like TradingView). Zero network. */
 function indLiveValue(st, price) {
+  if (st.type === 'rsi') {
+    const d = price - st.lc;
+    return indRsiFrom((st.ag * (st.period - 1) + (d > 0 ? d : 0)) / st.period,
+                      (st.al * (st.period - 1) + (d < 0 ? -d : 0)) / st.period);
+  }
   if (st.type === 'sma')  return (st.sum - st.buf[0] + price) / st.period;
   if (st.type === 'dema') {
     const e1 = price * st.k + st.e1 * (1 - st.k);
@@ -2827,7 +2883,7 @@ function checkIndicatorTouchAlerts() {
       if (!indMarketOpen(alert.pairSymbol)) continue;                    // stale weekend price — same rule as price alerts
       const price = livePrice[alert.pairSymbol];
       if (!(price > 0)) continue;
-      const e = st.level;                                                // price == live indicator ⇔ price == level
+      const e = st.type === 'rsi' ? indRsiLevel(st, indTargetOf(alert)) : st.level;   // price == live indicator ⇔ price == level
       if (!indEnsureBaseline(alert, e)) continue;
 
       let hitSide = null;
@@ -2840,7 +2896,7 @@ function checkIndicatorTouchAlerts() {
       }
       if (!hitSide) continue;
       alert._emaWait = (price === e);   // exactly on the line right after firing → wait until price leaves it
-      indFire(alert, price, st.val, hitSide, 'Touch');
+      indFire(alert, price, st.type === 'rsi' ? indTargetOf(alert) : st.val, hitSide, 'Touch');
     } catch (e) { warn(`checkIndicatorTouchAlerts error: ${e.message}`); }
   }
 }
