@@ -147,6 +147,13 @@ const activeAlerts = {};
 // Track recently triggered to prevent double-fire
 const recentlyTriggered = new Set();
 
+// Repeating PRICE alerts: after a restart/deploy the side stored in RTDB can be stale (crossings
+// consumed by cooldown were never persisted, app edits overwrite the node without it), which made
+// old alerts fire on boot. Alerts created before this process started therefore re-learn their
+// side silently on their first evaluation. REP_SEEN = ids already evaluated in this process.
+const SERVER_BOOT_MS = Date.now();
+const REP_SEEN = new Set();
+
 // Yahoo consecutive fail counter (for email alert)
 let yahooFailCount = 0;
 
@@ -1393,6 +1400,19 @@ function checkRepeatingCrossing(alert, value) {
     alert._lastSide = currentSide;
     log(`  🔁 repeating alert ${alert.id} resumed — baseline set to '${currentSide}', no trigger`);
     return;
+  }
+
+  // First evaluation since this server process started, for an alert that already existed before
+  // the start (restart / deploy): never trust the stored side — adopt where the price is NOW and
+  // wait for the next real crossing. Alerts created while the server is running skip this and keep
+  // the creation-side baseline below, so their first real crossing still fires.
+  if (!REP_SEEN.has(alert.id)) {
+    REP_SEEN.add(alert.id);
+    if (alert._lastSide == null && (parseInt(alert.createdAt, 10) || 0) < SERVER_BOOT_MS - 60000) {
+      alert._lastSide = currentSide;
+      log(`  🔁 repeating alert ${alert.id} (${alert.pairSymbol} ${target}) loaded after restart — baseline '${currentSide}' (value=${value}), no trigger`);
+      return;
+    }
   }
 
   // First evaluation of this alert in this process: baseline = the side the price was
