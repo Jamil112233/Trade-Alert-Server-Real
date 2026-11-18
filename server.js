@@ -1311,15 +1311,26 @@ async function checkServerStopFlag() {
   } catch(e) { /* keep current state */ }
 }
 
+/** "320 total (290 price, 20 candle close, 10 indicator)" — price = instant, candle close = price candle-close, indicator = all indicator alerts. */
+function alertCountsText(list) {
+  let ind = 0, candle = 0, price = 0;
+  for (const a of list) {
+    if (a.alertKind === 'indicator') ind++;
+    else if (a.candleClose) candle++;
+    else price++;
+  }
+  return `${list.length} total (${price} price, ${candle} candle close, ${ind} indicator)`;
+}
+
 let _checkCount = 0;
 function checkAlerts() {
   _checkCount++;
   const alertList = Object.values(activeAlerts);
 
   if (_checkCount % 30 === 0) {
-    log(`Checker alive — ${alertList.length} alerts, BTC=${livePrice.BTC} XAU=${livePrice.XAU} EURUSD=${livePrice.EURUSD}`);
+    log(`Checker alive — ${alertCountsText(alertList)}, BTC=${livePrice.BTC} XAU=${livePrice.XAU} EURUSD=${livePrice.EURUSD}`);
     // Show all active instant alerts for debugging
-    alertList.filter(a => !a.candleClose).forEach(a => {
+    alertList.filter(a => !a.candleClose && a.alertKind !== 'indicator').forEach(a => {
       const p   = livePrice[a.pairSymbol];
       const mkt = (p && p > 0) ? '' : (isYahooSymbolOpen(a.pairSymbol) === false ? ' [market closed]' : ' [no price yet]');
       log(`  active: ${a.pairSymbol} ${a.direction} ${a.targetPrice} price=${p || 0}${mkt}`);
@@ -1582,7 +1593,7 @@ function checkCandleCloseAlerts(closedTfs) {
   const all       = Object.values(activeAlerts);
   const alertList = all.filter(a => a.candleClose && a.alertKind !== 'indicator' && closedTfs.includes(a.timeframe));
 
-  log(`  checkCandleCloseAlerts: ${all.length} total, ${alertList.length} match [${closedTfs.join(',')}]`);
+  log(`  checkCandleCloseAlerts: ${alertCountsText(all)}, ${alertList.length} match [${closedTfs.join(',')}]`);
   all.filter(a => a.candleClose && a.alertKind !== 'indicator').forEach(a =>
     log(`    alert: ${a.pairSymbol} ${a.direction} ${a.targetPrice} tf=${a.timeframe} candleClose=${a.candleClose}`)
   );
