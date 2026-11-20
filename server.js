@@ -3099,7 +3099,9 @@ const VOICE_CFG = {
 const VOICE_SAFE_ID      = /^[A-Za-z0-9_-]{1,128}$/;
 const VOICE_MIN_BYTES    = 6000;      // ~0.7 s at 64 kbps — anything smaller is a broken generation
 const VOICE_MAX_BYTES    = 400000;
-const VOICE_DELETE_AFTER = 10 * 60 * 1000;   // alert gone / voice switched off this long → delete the file
+const VOICE_DELETE_AFTER = 3 * 60 * 1000;    // alert gone / voice switched off this long → delete the file
+const VOICE_BULK_DELETE_AFTER = 60 * 60 * 1000;   // …but when MANY voices vanish at once (possible glitch) wait this long
+const VOICE_ORPHAN_MIN_AGE = 20 * 60 * 1000;     // R2 file with no record: only removed once this old
 const VOICE_RETRY_MS     = [30000, 120000, 600000, 3600000, 3600000];
 
 const voiceMeta     = new Map();   // `${uid}/${alertId}` → { textHash, hash, size, updatedAt }
@@ -3112,7 +3114,7 @@ const voiceRate     = new Map();   // uid → [timestamps] (endpoint rate limit)
 let voiceMetaLoaded = false;
 let voiceSeenAlerts = false;
 let voiceBlockedUntil = 0;         // credits / plan problem → stop generating until then
-let voiceStats = { generated: 0, failed: 0, reused: 0, deleted: 0 };
+let voiceStats = { generated: 0, failed: 0, reused: 0, deleted: 0, discarded: 0, orphansDeleted: 0 };
 let voiceNet = (opts, body, timeoutMs) => voiceHttps(opts, body, timeoutMs);   // swappable in tests
 
 function voiceEnabled() {
@@ -3212,20 +3214,20 @@ function awsV4Sign({ method, uri, query = '', headers, payloadHash, amzDate, reg
   return { signature, authorization: `AWS4-HMAC-SHA256 Credential=${accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}` };
 }
 function r2Key(uid, alertId) { return `voices/${uid}/${alertId}.mp3`; }
-async function r2Request(method, key, body, contentType) {
+async function r2Request(method, key, body, contentType, query = '') {
   const e = process.env;
   const host = `${e.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  const uri  = '/' + e.R2_BUCKET + '/' + key.split('/').map(encodeURIComponent).join('/');
+  const uri  = '/' + e.R2_BUCKET + (key ? '/' + key.split('/').map(encodeURIComponent).join('/') : '');
   const payload = body || Buffer.alloc(0);
   const payloadHash = voiceSha256Hex(payload);
   const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
   const headers = { host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate };
   if (contentType) headers['content-type'] = contentType;
-  const { authorization } = awsV4Sign({ method, uri, headers, payloadHash, amzDate, region: 'auto', service: 's3',
+  const { authorization } = awsV4Sign({ method, uri, query, headers, payloadHash, amzDate, region: 'auto', service: 's3',
     secret: e.R2_SECRET_ACCESS_KEY, accessKey: e.R2_ACCESS_KEY_ID });
   const reqHeaders = { ...headers, Authorization: authorization, 'Content-Length': payload.length };
   delete reqHeaders.host;
-  return voiceNet({ hostname: host, port: 443, path: uri, method, headers: reqHeaders }, payload.length ? payload : null, 25000);
+  return voiceNet({ hostname: host, port: 443, path: uri + (query ? '?' + query : ''), method, headers: reqHeaders }, payload.length ? payload : null, 25000);
 }
 
 // ── ElevenLabs ───────────────────────────────────────────────────────────────
@@ -3257,17 +3259,30 @@ async function elevenSpeak(text) {
 }
 
 // ── Generation job (generate → upload → verify upload → record) ─────────────
+// Is this exact sentence still wanted? (alert may have triggered / been deleted / edited while the job ran)
+function voiceStillWanted(job) {
+  const w = voiceWanted().get(`${job.uid}/${job.alertId}`);
+  return !!w && w.textHash === job.textHash;
+}
 async function voiceRunJob(job) {
   const mk = `${job.uid}/${job.alertId}`;
   const t0 = Date.now();
+  if (!voiceStillWanted(job)) { voiceStats.discarded++; log(`🗣 Voice skipped (alert already gone/changed): ${job.alertId}`); return; }   // shield 1: before spending credits
   const audio = await elevenSpeak(job.text);
   voiceBudget.push(Date.now());
+  if (!voiceStillWanted(job)) { voiceStats.discarded++; log(`🗣 Voice discarded — alert triggered/changed while it was being made: ${job.alertId}`); return; }   // shield 2: nothing stored
   const put = await r2Request('PUT', r2Key(job.uid, job.alertId), audio, 'audio/mpeg');
   if (put.status < 200 || put.status >= 300) throw new VoiceApiError(`R2 upload failed ${put.status} ${put.body.toString('utf8').slice(0, 150)}`, 'other');
   // verification step: the object must exist in R2 with exactly the bytes we sent
   const head = await r2Request('HEAD', r2Key(job.uid, job.alertId));
   const size = parseInt(head.headers['content-length'], 10);
   if (head.status !== 200 || size !== audio.length) throw new VoiceApiError(`R2 verify failed (status ${head.status}, size ${size} vs ${audio.length})`, 'other');
+  if (!voiceStillWanted(job)) {   // shield 3: alert went away during upload → remove the file again, record nothing
+    voiceStats.discarded++;
+    try { await r2Request('DELETE', r2Key(job.uid, job.alertId)); } catch (_) {}
+    log(`🗣 Voice discarded after upload (alert gone) and removed from storage: ${job.alertId}`);
+    return;
+  }
   const meta = { textHash: job.textHash, hash: voiceSha256Hex(audio).slice(0, 16), size: audio.length, updatedAt: Date.now() };
   const wr = await rtdbSet(`voices/${job.uid}/${job.alertId}`, meta);
   if (wr && typeof wr === 'object' && wr.error) throw new VoiceApiError(`RTDB metadata write failed: ${wr.error}`, 'other');
@@ -3368,12 +3383,14 @@ async function voiceSweep() {
     if (!voiceMissing.has(mk)) { voiceMissing.set(mk, now); continue; }
     if (now - voiceMissing.get(mk) >= VOICE_DELETE_AFTER) due.push(mk);
   }
-  // Safety net: never mass-delete because of a transient glitch (empty alert list, RTDB hiccup...)
+  // Safety net: if MANY voices vanish at once it might be a glitch (empty alert list, RTDB hiccup…). A glitch never lasts
+  // an hour, so in that case only files missing for a full hour are removed — real cleanups still finish, nothing is lost.
+  let todo = due;
   if (voiceMeta.size >= 5 && due.length > voiceMeta.size * 0.5) {
-    warn(`Voice sweep skipped: would delete ${due.length}/${voiceMeta.size} voices at once — looks like a glitch`);
-    return;
+    todo = due.filter(mk => now - voiceMissing.get(mk) >= VOICE_BULK_DELETE_AFTER);
+    if (todo.length < due.length) warn(`Voice sweep: ${due.length}/${voiceMeta.size} voices vanished at once — deleting only those missing for over an hour (${todo.length})`);
   }
-  for (const mk of due) {
+  for (const mk of todo) {
     const [uid, alertId] = mk.split('/');
     try {
       const r = await r2Request('DELETE', r2Key(uid, alertId));
@@ -3383,6 +3400,45 @@ async function voiceSweep() {
       voiceStats.deleted++;
       log(`🧹 Voice deleted: ${alertId} (alert finished or voice switched off) user=${uid}`);
     } catch (e) { warn(`Voice delete failed for ${alertId}: ${e.message}`); }
+  }
+}
+
+// ── R2 orphan sweep: files in the bucket that have no record at all (e.g. upload finished but the record write failed) ──
+async function r2ListVoiceFiles() {
+  const out = []; let token = null;
+  for (let page = 0; page < 20; page++) {
+    const q = (token ? 'continuation-token=' + encodeURIComponent(token) + '&' : '') + 'list-type=2&prefix=' + encodeURIComponent('voices/');
+    const r = await r2Request('GET', '', null, null, q);
+    if (r.status !== 200) throw new Error(`R2 list ${r.status}`);
+    const xml = r.body.toString('utf8');
+    for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+      const k = (m[1].match(/<Key>([^<]+)<\/Key>/) || [])[1];
+      const lm = (m[1].match(/<LastModified>([^<]+)<\/LastModified>/) || [])[1];
+      if (k) out.push({ key: k, modified: lm ? Date.parse(lm) : 0 });
+    }
+    const nt = (xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/) || [])[1];
+    if (!/<IsTruncated>true<\/IsTruncated>/.test(xml) || !nt) break;
+    token = nt;
+  }
+  return out;
+}
+async function voiceSweepOrphans() {
+  if (!voiceEnabled() || !voiceMetaLoaded || process.uptime() < 120) return;
+  const files = await r2ListVoiceFiles();
+  const wanted = voiceWanted();
+  const now = Date.now();
+  let n = 0;
+  for (const f of files) {
+    const m = f.key.match(/^voices\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_-]+)\.mp3$/);
+    if (!m) continue;
+    const mk = `${m[1]}/${m[2]}`;
+    if (voiceMeta.has(mk) || wanted.has(mk) || voiceInflight.has(mk)) continue;
+    if (!f.modified || now - f.modified < VOICE_ORPHAN_MIN_AGE) continue;
+    if (n >= 50) break;                                   // never delete more than 50 in one run
+    try {
+      const r = await r2Request('DELETE', f.key);
+      if (r.status === 204 || r.status === 200 || r.status === 404) { n++; voiceStats.orphansDeleted++; log(`🧹 Orphan voice file removed from storage: ${f.key}`); }
+    } catch (e) { warn(`Orphan delete failed for ${f.key}: ${e.message}`); }
   }
 }
 
@@ -3447,15 +3503,22 @@ function voiceHandleRequest(req, res) {
     if (!voiceRateOk(uid)) return json(429, { error: 'slow down' });
     if (url === '/voice/list') {
       const voices = [], pending = [];
-      for (const [mk, v] of voiceMeta) if (mk.startsWith(uid + '/')) voices.push({ alertId: mk.slice(uid.length + 1), hash: v.hash, size: v.size });
-      for (const mk of voiceWanted().keys()) if (mk.startsWith(uid + '/') && !voiceMeta.has(mk)) pending.push(mk.slice(uid.length + 1));
+      const wantedNow = voiceWanted();
+      for (const [mk, w] of wantedNow) {
+        if (!mk.startsWith(uid + '/')) continue;
+        const v = voiceMeta.get(mk);
+        if (v && v.textHash === w.textHash) voices.push({ alertId: mk.slice(uid.length + 1), hash: v.hash, size: v.size });
+        else pending.push(mk.slice(uid.length + 1));
+      }
       return json(200, { voices, pending });
     }
     const fm = url.match(/^\/voice\/file\/([A-Za-z0-9_-]{1,128})$/);
     if (!fm) return json(404, { error: 'not found' });
     const alertId = fm[1], mk = `${uid}/${alertId}`;
     const meta = voiceMeta.get(mk);
-    if (!meta) return json(voiceWanted().has(mk) ? 202 : 404, { status: voiceWanted().has(mk) ? 'pending' : 'none' });
+    const w = voiceWanted().get(mk);
+    if (!w) return json(404, { status: 'none' });                          // alert triggered / deleted / voice off → nothing to send
+    if (!meta || meta.textHash !== w.textHash) return json(202, { status: 'pending' });   // missing or still the OLD sentence → never send it
     const r = await r2Request('GET', r2Key(uid, alertId));
     if (r.status === 404) { voiceMeta.delete(mk); return json(404, { status: 'missing' }); }   // self-heal: reconcile regenerates it
     if (r.status !== 200) return json(502, { error: 'storage' });
@@ -3491,7 +3554,9 @@ function startVoiceModule() {
   log(`🗣 Voice alarm: ON — model ${VOICE_CFG.modelId}, voice ${VOICE_CFG.voiceId}, max ${VOICE_CFG.maxPerUser}/user, ${VOICE_CFG.maxPerHour}/hour`);
   voiceLoadMeta();
   setInterval(() => { try { voiceReconcile(); } catch (e) { warn(`voiceReconcile error: ${e.message}`); } }, 15000);
-  setInterval(() => { voiceSweep().catch(e => warn(`voiceSweep error: ${e.message}`)); }, 5 * 60 * 1000);
+  setInterval(() => { voiceSweep().catch(e => warn(`voiceSweep error: ${e.message}`)); }, 60 * 1000);
+  setTimeout(() => voiceSweepOrphans().catch(e => warn(`voiceSweepOrphans error: ${e.message}`)), 4 * 60 * 1000);
+  setInterval(() => { voiceSweepOrphans().catch(e => warn(`voiceSweepOrphans error: ${e.message}`)); }, 30 * 60 * 1000);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
