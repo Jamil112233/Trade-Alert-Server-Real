@@ -3175,9 +3175,18 @@ function voiceUnit(a) {
   if (VOICE_NO_UNIT_SYMBOLS.has(sym) || FOREX_PAIRS.has(sym)) return '';
   return ' dollars';                                   // crypto
 }
+// Short form ("3570$" / "3570.21$") costs about half the ElevenLabs credits of the spelled-out form and is read the same.
+// Set VOICE_TEXT_MODE=words on Render to go back to the long spelled-out sentences at any time.
+function voiceDigits(price) {
+  const n = Number(price);
+  if (!isFinite(n) || n < 1 || n >= 1e9) return null;                       // tiny / huge numbers stay spelled out (safer)
+  return n.toFixed(8).replace(/\.?0+$/, '');
+}
 function voiceBuildText(a) {
   const pair = voiceSpokenPair(a);
-  const num  = voiceNumberWords(a.targetPrice) + voiceUnit(a);
+  const digits = process.env.VOICE_TEXT_MODE === 'words' ? null : voiceDigits(a.targetPrice);
+  const unit = voiceUnit(a);
+  const num  = digits !== null ? digits + (unit ? '$' : '') : voiceNumberWords(a.targetPrice) + unit;
   if (a.candleClose) {
     const dir = a.direction === 'below' ? 'below' : 'above';
     return `${pair} candle closed ${dir} your price target ${num}.`;
@@ -3517,8 +3526,14 @@ function voiceHandleRequest(req, res) {
     const alertId = fm[1], mk = `${uid}/${alertId}`;
     const meta = voiceMeta.get(mk);
     const w = voiceWanted().get(mk);
-    if (!w) return json(404, { status: 'none' });                          // alert triggered / deleted / voice off → nothing to send
-    if (!meta || meta.textHash !== w.textHash) return json(202, { status: 'pending' });   // missing or still the OLD sentence → never send it
+    if (w) {
+      if (!meta || meta.textHash !== w.textHash) return json(202, { status: 'pending' });   // missing or still the OLD sentence → never send it
+    } else {
+      // Alert just triggered / was deleted: its finished voice stays downloadable until the sweep removes it (~3-4 min),
+      // so a phone that was closed or offline can still fetch it the moment the alarm fires.
+      const gone = voiceMissing.get(mk);
+      if (!meta || (gone && Date.now() - gone >= VOICE_DELETE_AFTER)) return json(404, { status: 'none' });
+    }
     const r = await r2Request('GET', r2Key(uid, alertId));
     if (r.status === 404) { voiceMeta.delete(mk); return json(404, { status: 'missing' }); }   // self-heal: reconcile regenerates it
     if (r.status !== 200) return json(502, { error: 'storage' });
