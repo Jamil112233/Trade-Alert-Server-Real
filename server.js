@@ -2158,6 +2158,7 @@ async function updateRtdbPrices() {
 function startHealthServer() {
   const port = process.env.PORT || 3000;
   http.createServer((req, res) => {
+    if (voiceHandleRequest(req, res)) return;   // VOICE-FEATURE
     // Test email endpoint — hit this URL in browser to verify email alerts work
     if (req.url === '/test-email') {
       sendAlertEmail('test', 'TradeAlert server email test', 'This is a test email from your TradeAlert server.\nIf you received this, email alerts are working correctly.');
@@ -3066,6 +3067,433 @@ function indDebugSnapshot() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SECTION 13 — VOICE ALARM  (VOICE-FEATURE)
+// Spoken alarm: when an Alarm-type price alert has voiceAlarm=true, the server writes a sentence
+// ("Gold reaches your price target four thousand five hundred dollars"), has ElevenLabs speak it ONCE,
+// stores the mp3 in Cloudflare R2 (one file per alert, per user) and the app downloads + caches it.
+// The app plays the cached file when the alarm fires and falls back to the normal ringtone otherwise.
+//
+// SELF-CONTAINED / EASY TO REMOVE:
+//   1. delete this whole section            2. delete the line  "voiceHandleRequest"  in startHealthServer
+//   3. delete the line  "startVoiceModule()"  in main()
+// Nothing else in the server reads or writes voice data. Kill switch without code changes: remove the
+// VOICE_ENABLED env var (or set it to 0) — the module then does nothing at all.
+//
+// ENV: VOICE_ENABLED=1, ELEVENLABS_API_KEY, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+// Optional: ELEVEN_VOICE_ID, ELEVEN_MODEL_ID, VOICE_MAX_PER_USER (15), VOICE_MAX_PER_HOUR (60), VOICE_CONCURRENCY (2)
+// ════════════════════════════════════════════════════════════════════════════
+
+const VOICE_CFG = {
+  voiceId:      process.env.ELEVEN_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL',   // Sarah
+  modelId:      process.env.ELEVEN_MODEL_ID || 'eleven_multilingual_v2',
+  stability:    0.75,
+  similarity:   0.75,
+  style:        0,
+  speed:        0.90,
+  speakerBoost: true,
+  format:       'mp3_44100_64',
+  maxPerUser:   parseInt(process.env.VOICE_MAX_PER_USER, 10) || 15,   // credit protection
+  maxPerHour:   parseInt(process.env.VOICE_MAX_PER_HOUR, 10) || 60,   // credit protection against loops
+  concurrency:  parseInt(process.env.VOICE_CONCURRENCY, 10)  || 2,    // ElevenLabs free plan = 2 parallel requests
+};
+const VOICE_SAFE_ID      = /^[A-Za-z0-9_-]{1,128}$/;
+const VOICE_MIN_BYTES    = 6000;      // ~0.7 s at 64 kbps — anything smaller is a broken generation
+const VOICE_MAX_BYTES    = 400000;
+const VOICE_DELETE_AFTER = 10 * 60 * 1000;   // alert gone / voice switched off this long → delete the file
+const VOICE_RETRY_MS     = [30000, 120000, 600000, 3600000, 3600000];
+
+const voiceMeta     = new Map();   // `${uid}/${alertId}` → { textHash, hash, size, updatedAt }
+const voiceMissing  = new Map();   // meta key → first time it stopped being wanted
+const voiceQueue    = [];          // pending jobs
+const voiceInflight = new Set();
+const voiceFails    = new Map();   // meta key → { n, nextAt }
+const voiceBudget   = [];          // timestamps of generations in the last hour
+const voiceRate     = new Map();   // uid → [timestamps] (endpoint rate limit)
+let voiceMetaLoaded = false;
+let voiceSeenAlerts = false;
+let voiceBlockedUntil = 0;         // credits / plan problem → stop generating until then
+let voiceStats = { generated: 0, failed: 0, reused: 0, deleted: 0 };
+let voiceNet = (opts, body, timeoutMs) => voiceHttps(opts, body, timeoutMs);   // swappable in tests
+
+function voiceEnabled() {
+  const e = process.env;
+  return e.VOICE_ENABLED === '1' && !!e.ELEVENLABS_API_KEY && !!e.R2_ACCOUNT_ID &&
+         !!e.R2_ACCESS_KEY_ID && !!e.R2_SECRET_ACCESS_KEY && !!e.R2_BUCKET;
+}
+
+function voiceHttps(opts, body, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(opts, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+// ── Sentence builder ─────────────────────────────────────────────────────────
+const VOICE_ONES = ['zero','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve',
+  'thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'];
+const VOICE_TENS = ['','','twenty','thirty','forty','fifty','sixty','seventy','eighty','ninety'];
+function voiceIntWords(n) {
+  if (n < 20)   return VOICE_ONES[n];
+  if (n < 100)  return VOICE_TENS[Math.floor(n / 10)] + (n % 10 ? ' ' + VOICE_ONES[n % 10] : '');
+  if (n < 1000) return VOICE_ONES[Math.floor(n / 100)] + ' hundred' + (n % 100 ? ' ' + voiceIntWords(n % 100) : '');
+  if (n < 1e6)  return voiceIntWords(Math.floor(n / 1000)) + ' thousand' + (n % 1000 ? ' ' + voiceIntWords(n % 1000) : '');
+  if (n < 1e9)  return voiceIntWords(Math.floor(n / 1e6)) + ' million' + (n % 1e6 ? ' ' + voiceIntWords(n % 1e6) : '');
+  return String(n).split('').map(c => VOICE_ONES[+c]).join(' ');
+}
+/** 4500.5 → "four thousand five hundred point five";  1.085 → "one point zero eight five" */
+function voiceNumberWords(price) {
+  let s = Number(price).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+  const [i, d] = s.split('.');
+  let out = voiceIntWords(parseInt(i, 10));
+  if (d) out += ' point ' + d.split('').map(c => VOICE_ONES[+c]).join(' ');
+  return out;
+}
+const VOICE_CCY = { USD:'US Dollar', EUR:'Euro', GBP:'British Pound', JPY:'Japanese Yen', AUD:'Australian Dollar',
+  CAD:'Canadian Dollar', CHF:'Swiss Franc', NZD:'New Zealand Dollar' };
+function voiceSpokenPair(a) {
+  let n = String(a.pairName || a.pairSymbol || 'Price').trim();
+  const m = n.match(/^([A-Za-z]{3})\s*\/\s*([A-Za-z]{3})$/);
+  if (m) return `${VOICE_CCY[m[1].toUpperCase()] || m[1]} ${VOICE_CCY[m[2].toUpperCase()] || m[2]}`;
+  n = n.replace(/&/g, ' and ').replace(/([A-Za-z])(\d)/g, '$1 $2').replace(/\s+/g, ' ').trim();
+  return n;
+}
+const VOICE_DOLLAR_SYMBOLS = new Set(['XAU', 'XAG']);
+const VOICE_NO_UNIT_SYMBOLS = new Set(['SPX500', 'US30', 'US100', 'DXY', 'NIF50']);
+function voiceUnit(a) {
+  const sym = String(a.pairSymbol || '').toUpperCase();
+  if (VOICE_DOLLAR_SYMBOLS.has(sym)) return ' dollars';
+  if (VOICE_NO_UNIT_SYMBOLS.has(sym) || FOREX_PAIRS.has(sym)) return '';
+  return ' dollars';                                   // crypto
+}
+function voiceBuildText(a) {
+  const pair = voiceSpokenPair(a);
+  const num  = voiceNumberWords(a.targetPrice) + voiceUnit(a);
+  if (a.candleClose) {
+    const dir = a.direction === 'below' ? 'below' : 'above';
+    return `${pair} candle closed ${dir} your price target ${num}.`;
+  }
+  return `${pair} reaches your price target ${num}.`;
+}
+function voiceHash(str) { return require('crypto').createHash('sha256').update(str).digest('hex').slice(0, 16); }
+function voiceSeed(text) { return parseInt(require('crypto').createHash('sha256').update(text).digest('hex').slice(0, 8), 16); }
+
+function voiceEligible(id, a) {
+  return !!a && VOICE_SAFE_ID.test(id) && VOICE_SAFE_ID.test(String(a.userId || '')) &&
+         (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true &&
+         a.alertKind !== 'indicator' && Number(a.targetPrice) > 0;
+}
+
+// ── Cloudflare R2 (S3 API, AWS Signature V4 — no SDK needed) ────────────────
+function voiceSha256Hex(data) { return require('crypto').createHash('sha256').update(data).digest('hex'); }
+function voiceHmac(key, data) { return require('crypto').createHmac('sha256', key).update(data).digest(); }
+function awsV4Sign({ method, uri, query = '', headers, payloadHash, amzDate, region, service, secret, accessKey }) {
+  const day = amzDate.slice(0, 8);
+  const lower = {};
+  for (const k of Object.keys(headers)) lower[k.toLowerCase()] = String(headers[k]).trim();
+  const names = Object.keys(lower).sort();
+  const canonHeaders = names.map(n => `${n}:${lower[n]}\n`).join('');
+  const signed = names.join(';');
+  const canonical = [method, uri, query, canonHeaders, signed, payloadHash].join('\n');
+  const scope = `${day}/${region}/${service}/aws4_request`;
+  const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, voiceSha256Hex(canonical)].join('\n');
+  const kDate = voiceHmac('AWS4' + secret, day);
+  const kReg  = voiceHmac(kDate, region);
+  const kSvc  = voiceHmac(kReg, service);
+  const kSig  = voiceHmac(kSvc, 'aws4_request');
+  const signature = require('crypto').createHmac('sha256', kSig).update(toSign).digest('hex');
+  return { signature, authorization: `AWS4-HMAC-SHA256 Credential=${accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}` };
+}
+function r2Key(uid, alertId) { return `voices/${uid}/${alertId}.mp3`; }
+async function r2Request(method, key, body, contentType) {
+  const e = process.env;
+  const host = `${e.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const uri  = '/' + e.R2_BUCKET + '/' + key.split('/').map(encodeURIComponent).join('/');
+  const payload = body || Buffer.alloc(0);
+  const payloadHash = voiceSha256Hex(payload);
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const headers = { host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate };
+  if (contentType) headers['content-type'] = contentType;
+  const { authorization } = awsV4Sign({ method, uri, headers, payloadHash, amzDate, region: 'auto', service: 's3',
+    secret: e.R2_SECRET_ACCESS_KEY, accessKey: e.R2_ACCESS_KEY_ID });
+  const reqHeaders = { ...headers, Authorization: authorization, 'Content-Length': payload.length };
+  delete reqHeaders.host;
+  return voiceNet({ hostname: host, port: 443, path: uri, method, headers: reqHeaders }, payload.length ? payload : null, 25000);
+}
+
+// ── ElevenLabs ───────────────────────────────────────────────────────────────
+class VoiceApiError extends Error { constructor(msg, kind) { super(msg); this.kind = kind; } }   // kind: quota | busy | other
+async function elevenSpeak(text) {
+  const payload = JSON.stringify({
+    text,
+    model_id: VOICE_CFG.modelId,
+    voice_settings: { stability: VOICE_CFG.stability, similarity_boost: VOICE_CFG.similarity, style: VOICE_CFG.style,
+                      speed: VOICE_CFG.speed, use_speaker_boost: VOICE_CFG.speakerBoost },
+    seed: voiceSeed(text),
+  });
+  const res = await voiceNet({
+    hostname: 'api.elevenlabs.io', port: 443, method: 'POST',
+    path: `/v1/text-to-speech/${encodeURIComponent(VOICE_CFG.voiceId)}?output_format=${VOICE_CFG.format}`,
+    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json',
+               'Accept': 'audio/mpeg', 'Content-Length': Buffer.byteLength(payload) },
+  }, payload, 30000);
+  if (res.status !== 200) {
+    const msg = res.body.toString('utf8').slice(0, 300);
+    if (res.status === 429 && /concurrent|rate/i.test(msg)) throw new VoiceApiError(`busy: ${msg}`, 'busy');
+    if (res.status === 401 || res.status === 402 || /quota|payment|credit|exceeded/i.test(msg))
+      throw new VoiceApiError(`${res.status} ${msg}`, 'quota');
+    throw new VoiceApiError(`${res.status} ${msg}`, 'other');
+  }
+  if (res.body.length < VOICE_MIN_BYTES || res.body.length > VOICE_MAX_BYTES)
+    throw new VoiceApiError(`unexpected audio size ${res.body.length} bytes`, 'other');
+  return res.body;
+}
+
+// ── Generation job (generate → upload → verify upload → record) ─────────────
+async function voiceRunJob(job) {
+  const mk = `${job.uid}/${job.alertId}`;
+  const t0 = Date.now();
+  const audio = await elevenSpeak(job.text);
+  voiceBudget.push(Date.now());
+  const put = await r2Request('PUT', r2Key(job.uid, job.alertId), audio, 'audio/mpeg');
+  if (put.status < 200 || put.status >= 300) throw new VoiceApiError(`R2 upload failed ${put.status} ${put.body.toString('utf8').slice(0, 150)}`, 'other');
+  // verification step: the object must exist in R2 with exactly the bytes we sent
+  const head = await r2Request('HEAD', r2Key(job.uid, job.alertId));
+  const size = parseInt(head.headers['content-length'], 10);
+  if (head.status !== 200 || size !== audio.length) throw new VoiceApiError(`R2 verify failed (status ${head.status}, size ${size} vs ${audio.length})`, 'other');
+  const meta = { textHash: job.textHash, hash: voiceSha256Hex(audio).slice(0, 16), size: audio.length, updatedAt: Date.now() };
+  const wr = await rtdbSet(`voices/${job.uid}/${job.alertId}`, meta);
+  if (wr && typeof wr === 'object' && wr.error) throw new VoiceApiError(`RTDB metadata write failed: ${wr.error}`, 'other');
+  voiceMeta.set(mk, meta);
+  voiceFails.delete(mk);
+  voiceStats.generated++;
+  log(`🗣 Voice ready: ${job.alertId} · "${job.text}" · ${(audio.length / 1024).toFixed(1)} KB · ${Date.now() - t0} ms · user=${job.uid}`);
+}
+
+function voiceBudgetLeft() {
+  const cut = Date.now() - 3600000;
+  while (voiceBudget.length && voiceBudget[0] < cut) voiceBudget.shift();
+  return VOICE_CFG.maxPerHour - voiceBudget.length;
+}
+
+async function voicePump() {
+  while (voiceInflight.size < VOICE_CFG.concurrency && voiceQueue.length) {
+    if (Date.now() < voiceBlockedUntil) return;
+    if (voiceBudgetLeft() <= 0) { warn('Voice: hourly generation limit reached — waiting'); return; }
+    const job = voiceQueue.shift();
+    const mk = `${job.uid}/${job.alertId}`;
+    voiceInflight.add(mk);
+    (async () => {
+      try {
+        await voiceRunJob(job);
+      } catch (e) {
+        voiceStats.failed++;
+        const f = voiceFails.get(mk) || { n: 0, nextAt: 0 };
+        if (e.kind === 'busy') {
+          f.nextAt = Date.now() + 20000;                       // not the alert's fault — doesn't count as an attempt
+        } else {
+          f.n++;
+          f.nextAt = Date.now() + VOICE_RETRY_MS[Math.min(f.n - 1, VOICE_RETRY_MS.length - 1)];
+          if (e.kind === 'quota') {
+            voiceBlockedUntil = Date.now() + 60 * 60 * 1000;
+            sendAlertEmail('voice_quota', 'Voice alarm: ElevenLabs credits / plan problem',
+              `ElevenLabs rejected a voice request:\n${e.message}\n\nNew voices are paused for 1 hour; alerts keep ringing with the normal ringtone.`);
+          }
+        }
+        voiceFails.set(mk, f);
+        warn(`Voice generation failed for ${job.alertId} (attempt ${f.n}): ${e.message}`);
+      } finally {
+        voiceInflight.delete(mk);
+        setImmediate(voicePump);
+      }
+    })();
+  }
+}
+
+// ── Reconcile: which alerts want a voice? (in-memory scan, no network unless something changed) ──
+function voiceWanted() {
+  const perUser = {};
+  for (const [id, a] of Object.entries(activeAlerts)) {
+    if (!voiceEligible(id, a)) continue;
+    (perUser[a.userId] = perUser[a.userId] || []).push({ id, a });
+  }
+  const wanted = new Map();
+  for (const uid of Object.keys(perUser)) {
+    perUser[uid].sort((x, y) => (x.a.createdAt || 0) - (y.a.createdAt || 0));
+    perUser[uid].slice(0, VOICE_CFG.maxPerUser).forEach(({ id, a }) => {
+      const text = voiceBuildText(a);
+      wanted.set(`${uid}/${id}`, { uid, alertId: id, text, textHash: voiceHash(text) });
+    });
+  }
+  return wanted;
+}
+function voiceReconcile() {
+  if (!voiceEnabled() || !voiceMetaLoaded) return;
+  if (Object.keys(activeAlerts).length) voiceSeenAlerts = true;
+  const wanted = voiceWanted();
+  const queued = new Set(voiceQueue.map(j => `${j.uid}/${j.alertId}`));
+  for (const [mk, job] of wanted) {
+    voiceMissing.delete(mk);
+    const have = voiceMeta.get(mk);
+    if (have && have.textHash === job.textHash) continue;
+    if (voiceInflight.has(mk) || queued.has(mk)) continue;
+    const f = voiceFails.get(mk);
+    if (f && (f.nextAt > Date.now() || f.n >= VOICE_RETRY_MS.length)) continue;
+    voiceQueue.push(job);
+    log(`🗣 Voice queued: ${job.alertId} · "${job.text}"`);
+  }
+  // Drop queued jobs whose alert is gone or changed
+  for (let i = voiceQueue.length - 1; i >= 0; i--) {
+    const j = voiceQueue[i], w = wanted.get(`${j.uid}/${j.alertId}`);
+    if (!w || w.textHash !== j.textHash) voiceQueue.splice(i, 1);
+  }
+  voicePump();
+}
+
+// ── Sweep: delete files whose alert is gone (triggered once / deleted / voice switched off) ──
+async function voiceSweep() {
+  if (!voiceEnabled() || !voiceMetaLoaded || !voiceSeenAlerts || process.uptime() < 120) return;
+  const wanted = voiceWanted();
+  const now = Date.now();
+  const due = [];
+  for (const mk of voiceMeta.keys()) {
+    if (wanted.has(mk)) { voiceMissing.delete(mk); continue; }
+    if (!voiceMissing.has(mk)) { voiceMissing.set(mk, now); continue; }
+    if (now - voiceMissing.get(mk) >= VOICE_DELETE_AFTER) due.push(mk);
+  }
+  // Safety net: never mass-delete because of a transient glitch (empty alert list, RTDB hiccup...)
+  if (voiceMeta.size >= 5 && due.length > voiceMeta.size * 0.5) {
+    warn(`Voice sweep skipped: would delete ${due.length}/${voiceMeta.size} voices at once — looks like a glitch`);
+    return;
+  }
+  for (const mk of due) {
+    const [uid, alertId] = mk.split('/');
+    try {
+      const r = await r2Request('DELETE', r2Key(uid, alertId));
+      if (r.status !== 204 && r.status !== 200 && r.status !== 404) throw new Error(`R2 delete ${r.status}`);
+      await rtdbDelete(`voices/${uid}/${alertId}`);
+      voiceMeta.delete(mk); voiceMissing.delete(mk); voiceFails.delete(mk);
+      voiceStats.deleted++;
+      log(`🧹 Voice deleted: ${alertId} (alert finished or voice switched off) user=${uid}`);
+    } catch (e) { warn(`Voice delete failed for ${alertId}: ${e.message}`); }
+  }
+}
+
+// ── Firebase ID-token check (so only the owner can download a voice) ────────
+let voiceCerts = { at: 0, certs: {} };
+async function voiceGetCerts() {
+  if (Date.now() - voiceCerts.at < 3600000 && Object.keys(voiceCerts.certs).length) return voiceCerts.certs;
+  const res = await voiceNet({ hostname: 'www.googleapis.com', port: 443, method: 'GET',
+    path: '/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com', headers: {} }, null, 10000);
+  if (res.status !== 200) throw new Error(`cert fetch ${res.status}`);
+  voiceCerts = { at: Date.now(), certs: JSON.parse(res.body.toString('utf8')) };
+  return voiceCerts.certs;
+}
+async function voiceVerifyToken(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return null;
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (header.alg !== 'RS256') return null;
+    const certs = await voiceGetCerts();
+    const pem = certs[header.kid];
+    if (!pem) return null;
+    const ok = require('crypto').createVerify('RSA-SHA256').update(parts[0] + '.' + parts[1])
+      .verify(pem, Buffer.from(parts[2], 'base64url'));
+    if (!ok) return null;
+    const now = Math.floor(Date.now() / 1000);
+    if (claims.aud !== FIREBASE_PROJECT_ID || claims.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) return null;
+    if (!(claims.exp > now) || claims.iat > now + 300 || !claims.sub || !VOICE_SAFE_ID.test(claims.sub)) return null;
+    return claims.sub;
+  } catch (e) { return null; }
+}
+function voiceRateOk(uid) {
+  const now = Date.now(), arr = (voiceRate.get(uid) || []).filter(t => now - t < 60000);
+  if (arr.length >= 60) { voiceRate.set(uid, arr); return false; }
+  arr.push(now); voiceRate.set(uid, arr); return true;
+}
+
+// ── HTTP endpoints (called from startHealthServer) ──────────────────────────
+//   GET /voice/list            → { voices:[{alertId,hash,size}], pending:[alertId] }
+//   GET /voice/file/{alertId}  → 200 audio/mpeg | 202 still being made | 404 none
+// Returns true when the request was a /voice request (handled here).
+function voiceHandleRequest(req, res) {
+  const url = req.url || '';
+  if (url === '/admin/voice') {
+    const secret = req.headers['x-admin-secret'];
+    if (!process.env.ADMIN_PANEL_SECRET || secret !== process.env.ADMIN_PANEL_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ enabled: voiceEnabled(), stored: voiceMeta.size, queued: voiceQueue.length, inflight: voiceInflight.size,
+      blockedForMs: Math.max(0, voiceBlockedUntil - Date.now()), generationsLastHour: voiceBudget.length, ...voiceStats }));
+    return true;
+  }
+  if (!url.startsWith('/voice/')) return false;
+  const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  (async () => {
+    if (!voiceEnabled()) return json(503, { status: 'off' });
+    const m = (req.headers['authorization'] || '').match(/^Bearer\s+(.+)$/i);
+    const uid = m ? await voiceVerifyToken(m[1]) : null;
+    if (!uid) return json(401, { error: 'unauthorized' });
+    if (!voiceRateOk(uid)) return json(429, { error: 'slow down' });
+    if (url === '/voice/list') {
+      const voices = [], pending = [];
+      for (const [mk, v] of voiceMeta) if (mk.startsWith(uid + '/')) voices.push({ alertId: mk.slice(uid.length + 1), hash: v.hash, size: v.size });
+      for (const mk of voiceWanted().keys()) if (mk.startsWith(uid + '/') && !voiceMeta.has(mk)) pending.push(mk.slice(uid.length + 1));
+      return json(200, { voices, pending });
+    }
+    const fm = url.match(/^\/voice\/file\/([A-Za-z0-9_-]{1,128})$/);
+    if (!fm) return json(404, { error: 'not found' });
+    const alertId = fm[1], mk = `${uid}/${alertId}`;
+    const meta = voiceMeta.get(mk);
+    if (!meta) return json(voiceWanted().has(mk) ? 202 : 404, { status: voiceWanted().has(mk) ? 'pending' : 'none' });
+    const r = await r2Request('GET', r2Key(uid, alertId));
+    if (r.status === 404) { voiceMeta.delete(mk); return json(404, { status: 'missing' }); }   // self-heal: reconcile regenerates it
+    if (r.status !== 200) return json(502, { error: 'storage' });
+    res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': r.body.length, 'X-Voice-Hash': meta.hash });
+    res.end(r.body);
+  })().catch(e => { warn(`Voice endpoint error: ${e.message}`); try { json(500, { error: 'server' }); } catch (_) {} });
+  return true;
+}
+
+async function voiceLoadMeta() {
+  try {
+    const all = await rtdbGet('voices');
+    if (all && typeof all === 'object' && all.error) throw new Error(String(all.error));   // never treat an error reply as "no voices" (would regenerate everything)
+    if (typeof all === 'string') throw new Error('unexpected RTDB reply');
+    voiceMeta.clear();
+    if (all && typeof all === 'object') {
+      for (const [uid, byAlert] of Object.entries(all)) {
+        if (!byAlert || typeof byAlert !== 'object') continue;
+        for (const [alertId, m] of Object.entries(byAlert)) if (m && m.hash) voiceMeta.set(`${uid}/${alertId}`, m);
+      }
+    }
+    voiceMetaLoaded = true;
+    log(`🗣 Voice module ready — ${voiceMeta.size} stored voice(s)`);
+  } catch (e) {
+    warn(`Voice metadata load failed (${e.message}) — retrying in 30s; no voices are generated until it loads`);
+    setTimeout(voiceLoadMeta, 30000);
+  }
+}
+
+function startVoiceModule() {
+  if (!voiceEnabled()) { log('🗣 Voice alarm: OFF (VOICE_ENABLED / keys not set)'); return; }
+  log(`🗣 Voice alarm: ON — model ${VOICE_CFG.modelId}, voice ${VOICE_CFG.voiceId}, max ${VOICE_CFG.maxPerUser}/user, ${VOICE_CFG.maxPerHour}/hour`);
+  voiceLoadMeta();
+  setInterval(() => { try { voiceReconcile(); } catch (e) { warn(`voiceReconcile error: ${e.message}`); } }, 15000);
+  setInterval(() => { voiceSweep().catch(e => warn(`voiceSweep error: ${e.message}`)); }, 5 * 60 * 1000);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -3117,6 +3545,8 @@ async function main() {
 
   // Minute-boundary candle close checker
   startMinuteBoundaryChecker();
+
+  startVoiceModule();   // VOICE-FEATURE (does nothing unless VOICE_ENABLED=1)
 
   // Check server stop flag every minute
   setInterval(checkServerStopFlag, 60000);
