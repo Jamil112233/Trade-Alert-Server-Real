@@ -3443,7 +3443,7 @@ function voiceHandleRequest(req, res) {
     if (!voiceEnabled()) return json(503, { status: 'off' });
     const m = (req.headers['authorization'] || '').match(/^Bearer\s+(.+)$/i);
     const uid = m ? await voiceVerifyToken(m[1]) : null;
-    if (!uid) return json(401, { error: 'unauthorized' });
+    if (!uid) { log(`🗣 Voice request refused (401): ${url.slice(0, 40)} — ${m ? 'token not accepted' : 'no token'}`); return json(401, { error: 'unauthorized' }); }
     if (!voiceRateOk(uid)) return json(429, { error: 'slow down' });
     if (url === '/voice/list') {
       const voices = [], pending = [];
@@ -3459,6 +3459,7 @@ function voiceHandleRequest(req, res) {
     const r = await r2Request('GET', r2Key(uid, alertId));
     if (r.status === 404) { voiceMeta.delete(mk); return json(404, { status: 'missing' }); }   // self-heal: reconcile regenerates it
     if (r.status !== 200) return json(502, { error: 'storage' });
+    log(`🗣 Voice sent to phone: ${alertId} · ${(r.body.length / 1024).toFixed(1)} KB`);
     res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': r.body.length, 'X-Voice-Hash': meta.hash });
     res.end(r.body);
   })().catch(e => { warn(`Voice endpoint error: ${e.message}`); try { json(500, { error: 'server' }); } catch (_) {} });
