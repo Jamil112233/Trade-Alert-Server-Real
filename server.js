@@ -3182,14 +3182,36 @@ function voiceDigits(price) {
   if (!isFinite(n) || n < 1 || n >= 1e9) return null;                       // tiny / huge numbers stay spelled out (safer)
   return n.toFixed(8).replace(/\.?0+$/, '');
 }
+const VOICE_TF = { M1: ['1 minute', 'one minute'], M5: ['5 minute', 'five minute'], M15: ['15 minute', 'fifteen minute'], M30: ['30 minute', 'thirty minute'],
+                   H1: ['1 hour', 'one hour'], H4: ['4 hour', 'four hour'], D1: ['daily', 'daily'] };
+const VOICE_IND = { ema: 'E M A', sma: 'S M A', dema: 'D E M A', rsi: 'R S I', vwap: 'V W A P' };   // letters spaced so they are read letter by letter
 function voiceBuildText(a) {
+  const words = process.env.VOICE_TEXT_MODE === 'words';
   const pair = voiceSpokenPair(a);
-  const digits = process.env.VOICE_TEXT_MODE === 'words' ? null : voiceDigits(a.targetPrice);
+  const tfRaw = VOICE_TF[String(a.timeframe || '').toUpperCase()];
+  const tf = tfRaw ? tfRaw[words ? 1 : 0] + ' ' : '';                       // "5 minute " (empty if unknown)
+  const spoken = n => { const d = words ? null : voiceDigits(n); return d !== null ? d : voiceNumberWords(n); };
+
+  // ── Indicator alerts: "Gold reaches your 5 minute E M A 50." ──
+  if (a.alertKind === 'indicator') {
+    const type = VOICE_IND[a.indicatorType] ? a.indicatorType : 'ema';
+    const T = VOICE_IND[type];
+    const p1 = spoken(parseInt(a.indicatorPeriod, 10) || 0), p2 = spoken(parseInt(a.indicatorPeriod2, 10) || 0);
+    if (type === 'rsi')  return `${pair} ${tf}${T} reaches ${spoken(parseFloat(a.indicatorTarget) || 0)}.`;
+    if (type === 'vwap') return a.candleClose ? `${pair} ${tf}candle closed through your ${T}.` : `${pair} reaches your ${tf}${T}.`;
+    if (a.indicatorMode === 'crossover')
+      return a.candleClose ? `${pair} ${tf}candle confirmed ${T} ${p1} crossing ${T} ${p2}.` : `${pair} ${tf}${T} ${p1} crossed ${T} ${p2}.`;
+    return a.candleClose ? `${pair} ${tf}candle closed through your ${T} ${p1}.` : `${pair} reaches your ${tf}${T} ${p1}.`;
+  }
+
+  // ── Price alerts ──
   const unit = voiceUnit(a);
-  const num  = digits !== null ? digits + (unit ? '$' : '') : voiceNumberWords(a.targetPrice) + unit;
+  const d = words ? null : voiceDigits(a.targetPrice);
+  const num = d !== null ? d + (unit ? '$' : '') : voiceNumberWords(a.targetPrice) + unit;
   if (a.candleClose) {
-    const dir = a.direction === 'below' ? 'below' : 'above';
-    return `${pair} candle closed ${dir} your price target ${num}.`;
+    // One-time: direction never changes → "below"/"above". Repeating: it fires on every cross in either direction → neutral "through".
+    const dir = a.alertMode === 'repeating' ? 'through' : (a.direction === 'below' ? 'below' : 'above');
+    return `${pair} ${tf}candle closed ${dir} ${num}.`;                      // "Gold 1 minute candle closed below 4500$."
   }
   return `${pair} reaches your price target ${num}.`;
 }
@@ -3199,7 +3221,9 @@ function voiceSeed(text) { return parseInt(require('crypto').createHash('sha256'
 function voiceEligible(id, a) {
   return !!a && VOICE_SAFE_ID.test(id) && VOICE_SAFE_ID.test(String(a.userId || '')) &&
          (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true &&
-         a.alertKind !== 'indicator' && Number(a.targetPrice) > 0;
+         (a.alertKind === 'indicator'
+            ? (typeof indIsValid !== 'function' || indIsValid(a))              // indicator alert the engine can monitor
+            : Number(a.targetPrice) > 0);
 }
 
 // ── Cloudflare R2 (S3 API, AWS Signature V4 — no SDK needed) ────────────────
