@@ -3270,6 +3270,7 @@ const VOICE_LOW_THRESHOLDS = [1000, 500, 200];   // e-mail once for each, per ac
 const VOICE_SWITCH_AT      = 200;                // active account below this → use the next one
 const VOICE_SWITCH_BACK_AT = 1000;               // an earlier account that refilled above this is used again
 let voiceKeyIdx = 0;
+let voiceCreditsLoggedAt = 0;
 const voiceCredits = [];                         // per account: { readable, left, limit, resetAt, exhaustedUntil }
 let voiceCreditMail = null;                      // { k0: { reset, sent: {"1000":1} } } — also kept in RTDB so redeploys don't re-send
 let voiceCheckRunning = false, voiceCheckTimer = null, voiceFailovers = [];
@@ -3316,6 +3317,12 @@ async function voiceCreditsCheck() {
           warn(`Voice: cannot read credits of ElevenLabs account #${i + 1} (${c.status || c.err || 'bad reply'}) — its API key needs the "User → Read" permission; monitoring skipped for it`);
         voiceCredits[i] = { ...(voiceCredits[i] || {}), readable: false };
       }
+    }
+    // 0) show the numbers in the logs: after the first check and then once an hour
+    if (Date.now() - voiceCreditsLoggedAt >= 55 * 60 * 1000) {
+      voiceCreditsLoggedAt = Date.now();
+      log('🗣 ElevenLabs credits: ' + voiceCredits.slice(0, n).map((c, i) =>
+        `account #${i + 1} ${c && c.readable ? c.left.toLocaleString('en-US') + '/' + c.limit.toLocaleString('en-US') : 'unknown'}${i === Math.min(voiceKeyIdx, n - 1) ? ' (active)' : ''}`).join(' · '));
     }
     // 1) which account should be active?
     const cur = Math.min(voiceKeyIdx, n - 1);
