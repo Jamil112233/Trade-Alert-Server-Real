@@ -3263,9 +3263,139 @@ async function r2Request(method, key, body, contentType, query = '') {
   return voiceNet({ hostname: host, port: 443, path: uri + (query ? '?' + query : ''), method, headers: reqHeaders }, payload.length ? payload : null, 25000);
 }
 
+// ── ElevenLabs account pool: credit monitor, low-credit e-mails, automatic switch to a spare account ──
+// Spare accounts: add ELEVENLABS_API_KEY_2 (and optionally _3) on Render. With only one key this just monitors + e-mails.
+// The API key needs "User → Read" permission for the credit check to work (otherwise it is skipped, nothing else breaks).
+const VOICE_LOW_THRESHOLDS = [1000, 500, 200];   // e-mail once for each, per account and monthly cycle
+const VOICE_SWITCH_AT      = 200;                // active account below this → use the next one
+const VOICE_SWITCH_BACK_AT = 1000;               // an earlier account that refilled above this is used again
+let voiceKeyIdx = 0;
+const voiceCredits = [];                         // per account: { readable, left, limit, resetAt, exhaustedUntil }
+let voiceCreditMail = null;                      // { k0: { reset, sent: {"1000":1} } } — also kept in RTDB so redeploys don't re-send
+let voiceCheckRunning = false, voiceCheckTimer = null, voiceFailovers = [];
+
+function voiceKeys() { const e = process.env; return [e.ELEVENLABS_API_KEY, e.ELEVENLABS_API_KEY_2, e.ELEVENLABS_API_KEY_3].filter(k => !!k); }
+function voiceActiveKey() { const k = voiceKeys(); return k[Math.min(voiceKeyIdx, Math.max(0, k.length - 1))] || ''; }
+function voiceLeft(i) {                          // credits left on account i (Infinity = unknown, assume fine)
+  const c = voiceCredits[i];
+  if (!c) return Infinity;
+  if (c.exhaustedUntil && Date.now() < c.exhaustedUntil) return 0;
+  return c.readable ? c.left : Infinity;
+}
+async function voiceFetchCredits(i) {
+  const key = voiceKeys()[i];
+  if (!key) return { readable: false };
+  try {
+    const res = await voiceNet({ hostname: 'api.elevenlabs.io', port: 443, method: 'GET', path: '/v1/user/subscription',
+                                 headers: { 'xi-api-key': key, 'Accept': 'application/json' } }, null, 15000);
+    if (res.status !== 200) return { readable: false, status: res.status };
+    const j = JSON.parse(res.body.toString('utf8'));
+    const limit = Number(j.character_limit), used = Number(j.character_count);
+    if (!isFinite(limit) || !isFinite(used)) return { readable: false };
+    return { readable: true, left: Math.max(0, limit - used), limit, resetAt: Number(j.next_character_count_reset_unix) || 0 };
+  } catch (e) { return { readable: false, err: e.message }; }
+}
+async function voiceLoadCreditMail() {
+  if (voiceCreditMail) return;
+  try { const v = await rtdbGet('voiceConfig/credit_emails'); voiceCreditMail = (v && typeof v === 'object' && !v.error) ? v : {}; }
+  catch (_) { voiceCreditMail = {}; }
+}
+function voiceSaveCreditMail() { Promise.resolve(rtdbSet('voiceConfig/credit_emails', voiceCreditMail)).catch(() => {}); }
+
+async function voiceCreditsCheck() {
+  if (voiceCheckRunning || !voiceEnabled()) return;
+  voiceCheckRunning = true;
+  try {
+    await voiceLoadCreditMail();
+    const n = voiceKeys().length;
+    for (let i = 0; i < n; i++) {
+      const c = await voiceFetchCredits(i);
+      if (c.readable) voiceCredits[i] = { ...c, checkedAt: Date.now() };
+      else {
+        if (!voiceCredits[i] || voiceCredits[i].readable !== false)
+          warn(`Voice: cannot read credits of ElevenLabs account #${i + 1} (${c.status || c.err || 'bad reply'}) — its API key needs the "User → Read" permission; monitoring skipped for it`);
+        voiceCredits[i] = { ...(voiceCredits[i] || {}), readable: false };
+      }
+    }
+    // 1) which account should be active?
+    const cur = Math.min(voiceKeyIdx, n - 1);
+    let target = cur;
+    if (voiceLeft(cur) < VOICE_SWITCH_AT) {
+      for (let i = 0; i < n; i++) if (i !== cur && voiceLeft(i) >= VOICE_SWITCH_AT) { target = i; break; }
+    } else if (cur > 0) {
+      for (let i = 0; i < cur; i++) if (isFinite(voiceLeft(i)) && voiceLeft(i) >= VOICE_SWITCH_BACK_AT) { target = i; break; }   // earlier account refilled
+    }
+    const switched = target !== cur;
+    const fmt = i => voiceCredits[i] && voiceCredits[i].readable ? `${voiceCredits[i].left} credits left` : 'credits unknown';
+    if (switched) {
+      voiceKeyIdx = target;
+      log(`🗣 ElevenLabs: switched to account #${target + 1} (${fmt(target)})`);
+    }
+    // 2) low-credit e-mails (once per threshold per account and monthly cycle)
+    let changed = false, mailedSwitch = false;
+    for (let i = 0; i < n; i++) {
+      const c = voiceCredits[i];
+      if (!c || !c.readable) continue;
+      const mk = 'k' + i;
+      let m = voiceCreditMail[mk];
+      if (!m || typeof m !== 'object' || !m.sent) { m = voiceCreditMail[mk] = { reset: c.resetAt || 0, sent: {} }; changed = true; }
+      if ((c.resetAt && m.reset !== c.resetAt) || c.left >= 1500) {       // new monthly cycle or refilled → e-mails armed again
+        if (Object.keys(m.sent).length || m.reset !== (c.resetAt || 0)) changed = true;
+        m.reset = c.resetAt || 0; m.sent = {};
+      }
+      for (const t of VOICE_LOW_THRESHOLDS) {
+        if (c.left < t && !m.sent[t]) {
+          m.sent[t] = 1; changed = true;
+          let extra = '';
+          if (t === VOICE_SWITCH_AT) { if (switched && i === cur) mailedSwitch = true; extra = (switched && i === cur)
+            ? `\n\nSwitched automatically to ElevenLabs account #${target + 1} (${fmt(target)}).`
+            : (n > 1 ? '\n\nNo other account has enough credits to switch to.' : '\n\nNo second account is configured (ELEVENLABS_API_KEY_2), so new voices will stop when this runs out; alerts keep ringing with the normal ringtone.'); }
+          sendAlertEmail(`voice_credits_${i}_${t}`, `Voice alarm: ElevenLabs account #${i + 1} below ${t} credits`,
+            `ElevenLabs account #${i + 1} has ${c.left} of ${c.limit} credits left (below ${t}).${extra}`);
+        }
+      }
+    }
+    if (changed) voiceSaveCreditMail();
+    if (switched && !mailedSwitch) {
+      sendAlertEmail(`voice_switch_${target}`, `Voice alarm: now using ElevenLabs account #${target + 1}`, `Switched to ElevenLabs account #${target + 1} (${fmt(target)}).`);
+    }
+  } catch (e) { warn(`voiceCreditsCheck error: ${e.message}`); }
+  finally { voiceCheckRunning = false; }
+}
+// after a generation: keep the local number current and re-check as soon as a threshold is crossed
+function voiceDebit(keyIdx, chars) {
+  const c = voiceCredits[keyIdx];
+  if (!c || !c.readable) return;
+  const before = c.left;
+  c.left = Math.max(0, c.left - chars);
+  if (VOICE_LOW_THRESHOLDS.some(t => before >= t && c.left < t) && !voiceCheckTimer) {
+    voiceCheckTimer = setTimeout(() => { voiceCheckTimer = null; voiceCreditsCheck(); }, 5000);
+  }
+}
+// ElevenLabs refused the active account (quota / key rejected): move to a spare account right away if there is one
+function voiceFailOver(badIdx) {
+  const n = voiceKeys().length;
+  voiceCredits[badIdx] = { ...(voiceCredits[badIdx] || {}), left: 0, exhaustedUntil: Date.now() + 60 * 60 * 1000 };
+  const now = Date.now();
+  voiceFailovers = voiceFailovers.filter(t => now - t < 10 * 60 * 1000);
+  if (voiceFailovers.length >= 4) return false;                                // ping-pong guard → pause instead
+  for (let i = 0; i < n; i++) {
+    if (i !== badIdx && voiceLeft(i) >= 1) {
+      voiceFailovers.push(now);
+      voiceKeyIdx = i;
+      log(`🗣 ElevenLabs account #${badIdx + 1} refused the request — switched to account #${i + 1}`);
+      sendAlertEmail(`voice_failover_${i}`, `Voice alarm: switched to ElevenLabs account #${i + 1}`,
+        `ElevenLabs account #${badIdx + 1} refused a request (out of credits or key rejected). Switched automatically to account #${i + 1}.`);
+      return true;
+    }
+  }
+  return false;
+}
+
 // ── ElevenLabs ───────────────────────────────────────────────────────────────
 class VoiceApiError extends Error { constructor(msg, kind) { super(msg); this.kind = kind; } }   // kind: quota | busy | other
 async function elevenSpeak(text) {
+  const keyIdx = Math.min(voiceKeyIdx, Math.max(0, voiceKeys().length - 1));
   const payload = JSON.stringify({
     text,
     model_id: VOICE_CFG.modelId,
@@ -3276,18 +3406,20 @@ async function elevenSpeak(text) {
   const res = await voiceNet({
     hostname: 'api.elevenlabs.io', port: 443, method: 'POST',
     path: `/v1/text-to-speech/${encodeURIComponent(VOICE_CFG.voiceId)}?output_format=${VOICE_CFG.format}`,
-    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json',
+    headers: { 'xi-api-key': voiceActiveKey(), 'Content-Type': 'application/json',
                'Accept': 'audio/mpeg', 'Content-Length': Buffer.byteLength(payload) },
   }, payload, 30000);
   if (res.status !== 200) {
     const msg = res.body.toString('utf8').slice(0, 300);
     if (res.status === 429 && /concurrent|rate/i.test(msg)) throw new VoiceApiError(`busy: ${msg}`, 'busy');
-    if (res.status === 401 || res.status === 402 || /quota|payment|credit|exceeded/i.test(msg))
-      throw new VoiceApiError(`${res.status} ${msg}`, 'quota');
+    if (res.status === 401 || res.status === 402 || /quota|payment|credit|exceeded/i.test(msg)) {
+      const qe = new VoiceApiError(`${res.status} ${msg}`, 'quota'); qe.keyIdx = keyIdx; throw qe;
+    }
     throw new VoiceApiError(`${res.status} ${msg}`, 'other');
   }
   if (res.body.length < VOICE_MIN_BYTES || res.body.length > VOICE_MAX_BYTES)
     throw new VoiceApiError(`unexpected audio size ${res.body.length} bytes`, 'other');
+  voiceDebit(keyIdx, text.length);
   return res.body;
 }
 
@@ -3346,6 +3478,8 @@ async function voicePump() {
         const f = voiceFails.get(mk) || { n: 0, nextAt: 0 };
         if (e.kind === 'busy') {
           f.nextAt = Date.now() + 20000;                       // not the alert's fault — doesn't count as an attempt
+        } else if (e.kind === 'quota' && voiceFailOver(e.keyIdx != null ? e.keyIdx : voiceKeyIdx)) {
+          f.nextAt = Date.now() + 3000;                        // account problem, not the alert's fault — retry on the spare account
         } else {
           f.n++;
           f.nextAt = Date.now() + VOICE_RETRY_MS[Math.min(f.n - 1, VOICE_RETRY_MS.length - 1)];
@@ -3523,7 +3657,8 @@ function voiceHandleRequest(req, res) {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ enabled: voiceEnabled(), stored: voiceMeta.size, queued: voiceQueue.length, inflight: voiceInflight.size,
-      blockedForMs: Math.max(0, voiceBlockedUntil - Date.now()), generationsLastHour: voiceBudget.length, ...voiceStats }));
+      blockedForMs: Math.max(0, voiceBlockedUntil - Date.now()), activeAccount: voiceKeyIdx + 1,
+      accounts: voiceKeys().map((_, i) => ({ account: i + 1, active: i === voiceKeyIdx, credits: voiceCredits[i] && voiceCredits[i].readable ? { left: voiceCredits[i].left, limit: voiceCredits[i].limit } : 'unknown' })), generationsLastHour: voiceBudget.length, ...voiceStats }));
     return true;
   }
   if (!url.startsWith('/voice/')) return false;
@@ -3592,6 +3727,9 @@ function startVoiceModule() {
   if (!voiceEnabled()) { log('🗣 Voice alarm: OFF (VOICE_ENABLED / keys not set)'); return; }
   log(`🗣 Voice alarm: ON — model ${VOICE_CFG.modelId}, voice ${VOICE_CFG.voiceId}, max ${VOICE_CFG.maxPerUser}/user, ${VOICE_CFG.maxPerHour}/hour`);
   voiceLoadMeta();
+  log(`🗣 ElevenLabs accounts configured: ${voiceKeys().length}`);
+  setTimeout(() => voiceCreditsCheck(), 3000);
+  setInterval(() => voiceCreditsCheck(), 5 * 60 * 1000);
   setInterval(() => { try { voiceReconcile(); } catch (e) { warn(`voiceReconcile error: ${e.message}`); } }, 15000);
   setInterval(() => { voiceSweep().catch(e => warn(`voiceSweep error: ${e.message}`)); }, 60 * 1000);
   setTimeout(() => voiceSweepOrphans().catch(e => warn(`voiceSweepOrphans error: ${e.message}`)), 4 * 60 * 1000);
