@@ -3176,7 +3176,7 @@ function voiceUnit(a) {
   return ' dollars';                                   // crypto
 }
 // Short form ("3570$" / "3570.21$") costs about half the ElevenLabs credits of the spelled-out form and is read the same.
-// Set VOICE_TEXT_MODE=words on Render to go back to the long spelled-out sentences at any time.
+// DEFAULT is the spelled-out form (most reliable). Set VOICE_TEXT_MODE=digits on Render to try the short form.
 function voiceDigits(price) {
   const n = Number(price);
   if (!isFinite(n) || n < 1 || n >= 1e9) return null;                       // tiny / huge numbers stay spelled out (safer)
@@ -3186,7 +3186,7 @@ const VOICE_TF = { M1: ['1 minute', 'one minute'], M5: ['5 minute', 'five minute
                    H1: ['1 hour', 'one hour'], H4: ['4 hour', 'four hour'], D1: ['daily', 'daily'] };
 const VOICE_IND = { ema: 'E M A', sma: 'S M A', dema: 'D E M A', rsi: 'R S I', vwap: 'V W A P' };   // letters spaced so they are read letter by letter
 function voiceBuildText(a) {
-  const words = process.env.VOICE_TEXT_MODE === 'words';
+  const words = process.env.VOICE_TEXT_MODE !== 'digits';                  // default: numbers spelled out; VOICE_TEXT_MODE=digits → short form
   const pair = voiceSpokenPair(a);
   const tfRaw = VOICE_TF[String(a.timeframe || '').toUpperCase()];
   const tf = tfRaw ? tfRaw[words ? 1 : 0] + ' ' : '';                       // "5 minute " (empty if unknown)
