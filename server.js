@@ -3364,10 +3364,24 @@ function voiceSeed(text) { return parseInt(require('crypto').createHash('sha256'
 
 function voiceEligible(id, a) {
   return !!a && VOICE_SAFE_ID.test(id) && VOICE_SAFE_ID.test(String(a.userId || '')) &&
-         (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true && a.dual !== true &&
+         (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true &&
          (a.alertKind === 'indicator'
             ? (typeof indIsValid !== 'function' || indIsValid(a))              // indicator alert the engine can monitor
+            : a.dual === true ? (Number(a.targetAbove) > 0 && Number(a.targetBelow) > 0)
             : Number(a.targetPrice) > 0);
+}
+
+// The voice "slots" of an alert. A normal alert has one (id = alert id). A DUAL-TARGET alert has one per target that has
+// not fired yet: `${id}_above` and `${id}_below`, each with its own sentence. When a target fires its slot disappears
+// (→ that file is cleaned up after the usual grace window); the other one stays until the alert is finished.
+function voiceSlots(id, a) {
+  if (a.dual === true) {
+    const out = [];
+    if (!a.aboveHit) out.push({ vid: `${id}_above`, a: dualView(a, 'above', '') });
+    if (!a.belowHit) out.push({ vid: `${id}_below`, a: dualView(a, 'below', '') });
+    return out;
+  }
+  return [{ vid: id, a }];
 }
 
 // ── Cloudflare R2 (S3 API, AWS Signature V4 — no SDK needed) ────────────────
@@ -3661,8 +3675,10 @@ function voiceWanted() {
   for (const uid of Object.keys(perUser)) {
     perUser[uid].sort((x, y) => (x.a.createdAt || 0) - (y.a.createdAt || 0));
     perUser[uid].slice(0, VOICE_CFG.maxPerUser).forEach(({ id, a }) => {
-      const text = voiceBuildText(a);
-      wanted.set(`${uid}/${id}`, { uid, alertId: id, text, textHash: voiceHash(text) });
+      for (const slot of voiceSlots(id, a)) {
+        const text = voiceBuildText(slot.a);
+        wanted.set(`${uid}/${slot.vid}`, { uid, alertId: slot.vid, text, textHash: voiceHash(text) });
+      }
     });
   }
   return wanted;
