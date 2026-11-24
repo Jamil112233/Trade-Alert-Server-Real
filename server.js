@@ -605,6 +605,11 @@ function carryRuntimeState(oldAlert, newAlert) {
   if ((oldAlert.lastTriggeredAt || 0) > (newAlert.lastTriggeredAt || 0)) {
     newAlert.lastTriggeredAt = oldAlert.lastTriggeredAt;
   }
+  // Dual-target alerts: a side that already fired stays fired (a stale copy must never re-arm it)
+  if (newAlert.dual === true && oldAlert.dual === true) {
+    if (oldAlert.aboveHit && !newAlert.aboveHit && parseFloat(oldAlert.targetAbove) === parseFloat(newAlert.targetAbove)) newAlert.aboveHit = oldAlert.aboveHit;
+    if (oldAlert.belowHit && !newAlert.belowHit && parseFloat(oldAlert.targetBelow) === parseFloat(newAlert.targetBelow)) newAlert.belowHit = oldAlert.belowHit;
+  }
 
   // EMA alerts: keep the in-memory side tracker unless the indicator setup was edited
   if (oldAlert._emaSide && newAlert.alertKind === 'indicator'
@@ -1359,6 +1364,12 @@ function checkAlerts() {
       const price = livePrice[alert.pairSymbol];
       if (!price || price <= 0) continue;
 
+      if (alert.dual === true) {                       // DUAL-TARGET (above + below in one alert)
+        const side = dualCheck(alert, price);
+        if (side) fireDual(alert, side, price, 'Instant');
+        continue;
+      }
+
       const target = parseFloat(alert.targetPrice);
       if (!target) continue;
 
@@ -1618,6 +1629,12 @@ function checkCandleCloseAlerts(closedTfs) {
       log(`    checking ${alert.pairSymbol} ${alert.timeframe} close=${close} target=${alert.targetPrice} dir=${alert.direction} mode=${mode}`);
       if (!close || close <= 0) continue;
 
+      if (alert.dual === true) {                       // DUAL-TARGET (above + below in one alert)
+        const side = dualCheck(alert, close);
+        if (side) fireDual(alert, side, close, 'Candle close');
+        continue;
+      }
+
       const target = parseFloat(alert.targetPrice);
 
       if (mode === 'repeating') {
@@ -1777,6 +1794,7 @@ async function processTriggeredAlert(alert, hitPrice) {
     const hitAlert = { ...alert, triggered: true, hitAt: hitTime, layout: alert.layout || 'main' };
     delete hitAlert._emaSide;
     delete hitAlert._emaWait;
+    delete hitAlert._dualStage;
     const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
     const res3 = await fetchJson(
       `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
@@ -1845,6 +1863,120 @@ async function processTriggeredAlert(alert, hitPrice) {
   try {
     await sendFCM(userId, alert, hitPrice);
   } catch(e) { warn(`  FCM failed: ${e.message}`); }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 10a — DUAL-TARGET ALERTS (above + below in one alert)
+//
+// One alert document carries two targets: targetAbove / targetBelow. Always "once" style:
+//   dualDelete 'first' → whichever target is hit first fires and the alert is deleted
+//   dualDelete 'both'  → the first hit fires (history + FCM, alert STAYS with aboveHit/belowHit set),
+//                        the second hit fires and deletes the alert
+// targetPrice/direction on the stored alert mirror the ABOVE target so older code paths keep working.
+// ════════════════════════════════════════════════════════════════════════════
+
+function dualTargetOf(alert, side) { return Number(side === 'above' ? alert.targetAbove : alert.targetBelow) || 0; }
+
+// Which side (if any) does this price hit? A side that already fired is never checked again.
+function dualCheck(alert, price) {
+  const up = dualTargetOf(alert, 'above'), dn = dualTargetOf(alert, 'below');
+  if (!alert.aboveHit && up > 0 && price >= up) return 'above';
+  if (!alert.belowHit && dn > 0 && price <= dn) return 'below';
+  return null;
+}
+
+// A plain once-style copy of the alert describing the side that fired (used for history + FCM).
+function dualView(alert, side, stage) {
+  const v = { ...alert, direction: side, targetPrice: dualTargetOf(alert, side), alertMode: 'once', _dualStage: stage };
+  delete v.dual; delete v.targetAbove; delete v.targetBelow; delete v.dualDelete; delete v.aboveHit; delete v.belowHit;
+  return v;
+}
+
+function fireDual(alert, side, price, how) {
+  const both      = alert.dualDelete === 'both';
+  const otherHit  = side === 'above' ? alert.belowHit : alert.aboveHit;
+  const isFinal   = !both || !!otherHit;
+  log(`🎯 Dual alert (${how}): ${alert.pairSymbol} ${side} ${dualTargetOf(alert, side)} (price=${price}) mode=${both ? 'both' : 'first'} ${isFinal ? 'FINAL' : 'PARTIAL'} user=${alert.userId}`);
+  if (isFinal) {
+    recentlyTriggered.add(alert.id);
+    processTriggeredAlert(dualView(alert, side, 'final'), price).catch(e => {
+      err(`processTriggeredAlert (dual) error: ${e.message}`);
+      recentlyTriggered.delete(alert.id);
+    });
+  } else {
+    alert[side + 'Hit'] = Date.now();            // synchronous guard — this side can never fire twice
+    processDualPartial(alert, side, price).catch(e => err(`processDualPartial error: ${e.message}`));
+  }
+}
+
+// First hit of a "both" alert: record it, notify, keep the alert alive for the other target.
+async function processDualPartial(alert, side, price) {
+  const alertId = alert.id, userId = alert.userId;
+  const flag    = side + 'Hit';
+  const hitTime = alert[flag];
+  const histId  = `${alertId}_${side}`;
+  const view    = dualView(alert, side, 'partial');
+
+  await withVerifiedRetry(`RTDB update (dual ${alertId})`, async () => {
+    const { _lastSide, _justReenabled, _emaSide, _emaWait, userId: _uid, ...persistable } = alert;
+    await rtdbSet(`alerts/${userId}/${alertId}`, persistable);
+    if (await rtdbRemoveIfDeleted(userId, alertId)) return true;   // user deleted it meanwhile
+    const check = await rtdbGet(`alerts/${userId}/${alertId}`);
+    return !!check && check[flag] === hitTime;
+  });
+
+  await withVerifiedRetry(`Firestore active_alerts update (dual ${alertId})`,
+    () => updateActiveAlertFirestoreField(userId, alertId, { [flag]: hitTime }));
+
+  await withVerifiedRetry(`Firestore history write (dual ${histId})`, async () => {
+    const token    = await getAccessToken();
+    const hitAlert = { ...view, id: histId, triggered: true, hitAt: hitTime, active: false, layout: alert.layout || 'main' };
+    delete hitAlert._dualStage;
+    const docPath  = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/history/history`;
+    const res = await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ writes: [{
+          update: { name: docPath, fields: { [histId]: { stringValue: JSON.stringify(hitAlert) } } },
+          updateMask: { fieldPaths: ['`' + histId + '`'] }
+        }] })
+      });
+    return !res?.error;
+  });
+
+  await withVerifiedRetry(`Admin panel trigger log (dual ${alertId})`, async () => {
+    const token   = await getAccessToken();
+    const dateDoc = pkDateOnly(hitTime);
+    const docPath = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/admin_panel/${dateDoc}/alerts/alerts_trigger`;
+    const f = {
+      userId:      { stringValue: String(userId || '') },
+      pair:        { stringValue: String(alert.pairSymbol || '') },
+      targetPrice: { doubleValue: Number(view.targetPrice) || 0 },
+      candleClose: { booleanValue: !!alert.candleClose },
+      alertKind:   { stringValue: 'price' },
+      layoutId:    { stringValue: alert.layout || 'main' },
+      layout:      { stringValue: await getLayoutName(userId, alert.layout || 'main') },
+      triggerTime: { stringValue: pkTimeFull(hitTime) },
+    };
+    const res = await fetchJson(
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:commit`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ writes: [{
+          update: { name: docPath, fields: { [histId]: { mapValue: { fields: f } } } },
+          updateMask: { fieldPaths: ['`' + histId + '`'] }
+        }] })
+      });
+    return !res?.error;
+  }, 1);
+
+  await withVerifiedRetry(`FCM send (dual ${alertId})`, async () => {
+    try { await sendFCM(userId, view, price); return true; }
+    catch (e) { warn(`  sendFCM threw: ${e.message}`); return false; }
+  }, 2);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2101,6 +2233,7 @@ async function sendFCM(userId, alert, hitPrice) {
         timeframe:       String(alert.timeframe || ''),
         layout:          layoutId,
         layoutName:      layoutName,
+        dualStage:       String(alert._dualStage || ''),   // '' | 'partial' (alert stays) | 'final' (alert deleted)
       },
       // notification field intentionally omitted for ALL message types.
       // Sending a notification field causes Android to show a system-generated
@@ -3220,7 +3353,7 @@ function voiceSeed(text) { return parseInt(require('crypto').createHash('sha256'
 
 function voiceEligible(id, a) {
   return !!a && VOICE_SAFE_ID.test(id) && VOICE_SAFE_ID.test(String(a.userId || '')) &&
-         (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true &&
+         (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true && a.dual !== true &&
          (a.alertKind === 'indicator'
             ? (typeof indIsValid !== 'function' || indIsValid(a))              // indicator alert the engine can monitor
             : Number(a.targetPrice) > 0);
