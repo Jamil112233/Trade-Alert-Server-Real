@@ -658,6 +658,14 @@ async function pollAlertsFallback() {
 // Track whether we've done the first full load — reconnects skip the clear
 let rtdbHasLoaded = false;
 
+// Short description of an alert for logs. Dual-target alerts show BOTH targets + the delete option (+ which side already fired).
+function alertDesc(a) {
+  if (a && a.dual === true) {
+    return `${a.pairSymbol} DUAL ▲ ${a.targetAbove}${a.aboveHit ? ' ✔' : ''} / ▼ ${a.targetBelow}${a.belowHit ? ' ✔' : ''}, delete after ${a.dualDelete === 'both' ? 'both' : 'first'}`;
+  }
+  return `${a.pairSymbol} ${a.direction} ${a.targetPrice}`;
+}
+
 function handleRtdbEvent(event, data) {
   if (event === 'cancel' || event === 'auth_revoked') {
     warn(`RTDB SSE event: ${event}`);
@@ -765,7 +773,7 @@ function handleRtdbEvent(event, data) {
       if (value === null) {
         // Alert deleted — log with stack trace context
         const known = activeAlerts[alertId];
-        log(`RTDB alert removed: ${alertId}${known ? ` (${known.pairSymbol} ${known.direction} ${known.targetPrice})` : ' (not in cache)'}`);
+        log(`RTDB alert removed: ${alertId}${known ? ` (${alertDesc(known)})` : ' (not in cache)'}`);
         delete activeAlerts[alertId];
         scheduleGateResubscribe();
       } else {
@@ -776,10 +784,13 @@ function handleRtdbEvent(event, data) {
         // arrive, treating its partial value as the whole alert would wipe
         // targetPrice/pairSymbol/direction/etc from the cache and silently
         // stop this alert from ever being checked again.
+        const prevAlert = activeAlerts[alertId];
         const base   = event === 'patch' ? (activeAlerts[alertId] || {}) : {};
         const merged = { ...base, ...value, userId };
         activeAlerts[alertId] = carryRuntimeState(activeAlerts[alertId], merged);
-        log(`RTDB alert ${event === 'patch' ? 'patched' : 'added'}: ${alertId} (${merged.pairSymbol} ${merged.direction} ${merged.targetPrice})`);
+        // 'updated' = the alert was already known (e.g. the server's own write coming back, or an edit)
+        const verb = event === 'patch' ? 'patched' : (prevAlert ? 'updated' : 'added');
+        log(`RTDB alert ${verb}: ${alertId} (${alertDesc(activeAlerts[alertId])})`);
         scheduleGateResubscribe();
       }
     }
