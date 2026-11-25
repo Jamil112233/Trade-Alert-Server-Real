@@ -3455,8 +3455,9 @@ function voiceBuildText(a) {
   if (a._setupVoice === 'tp')   return `${pair} hit your take profit ${num}.`;
   if (a._setupVoice === 'sl')   return `${pair} hit your stop loss ${num}.`;
   if (a._setupVoice === 'entry') {
-    if (a.candleClose) return `${pair} ${tf}candle closed ${a.direction === 'below' ? 'below' : 'above'} your entry target ${num}.`;
-    return `${pair} reaches your entry target ${num}.`;
+    const side = a.setupSide === 'sell' ? 'sell ' : a.setupSide === 'buy' ? 'buy ' : '';
+    if (a.candleClose) return `${pair} ${tf}candle closed ${a.direction === 'below' ? 'below' : 'above'} your ${side}entry target ${num}.`;
+    return `${pair} reaches your ${side}entry target ${num}.`;
   }
   if (a.candleClose) {
     // One-time: direction never changes → "below"/"above". Repeating: it fires on every cross in either direction → neutral "through".
