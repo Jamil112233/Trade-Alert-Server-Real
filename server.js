@@ -2066,6 +2066,7 @@ function expirySweep() {
   const now = Date.now();
   for (const alert of Object.values(activeAlerts)) {
     const at = Number(alert.expiresAt) || 0;
+    if (alert.setup === true && alert.setupEntered) continue;   // an open trade never expires (it can last weeks)
     if (at > 0 && now >= at && !alert._expiring) expireAlert(alert).catch(e => warn(`expireAlert error: ${e.message}`));
   }
 }
