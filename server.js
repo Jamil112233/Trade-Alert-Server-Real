@@ -2012,6 +2012,64 @@ async function processDualPartial(alert, side, price) {
   }, 2);
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// SECTION 10a3 — ALERT EXPIRY (auto-delete at alert.expiresAt)
+// ════════════════════════════════════════════════════════════════════════════
+// The app computes expiresAt (epoch ms, from the user's own time zone / market rules) and saves it on the alert.
+// Absent or 0 = never expires. When the time arrives the alert is removed everywhere: memory, RTDB, Firestore
+// active_alerts and its voice file(s). An expired alert is NOT written to history (it never triggered).
+
+async function expiryDeleteVoices(userId, alertId) {
+  if (!voiceEnabled() || !voiceMetaLoaded) return;
+  for (const mk of [...voiceMeta.keys()]) {
+    const [uid, vid] = mk.split('/');
+    if (uid !== userId || !(vid === alertId || vid.startsWith(alertId + '_'))) continue;
+    try {
+      const r = await r2Request('DELETE', r2Key(uid, vid));
+      if (r.status !== 204 && r.status !== 200 && r.status !== 404) throw new Error(`R2 delete ${r.status}`);
+      await rtdbDelete(`voices/${uid}/${vid}`);
+      voiceMeta.delete(mk); voiceMissing.delete(mk); voiceFails.delete(mk);
+      voiceStats.deleted++;
+      log(`🧹 Voice deleted: ${vid} (alert expired) user=${uid}`);
+    } catch (e) { warn(`Voice delete failed for ${vid} (expiry): ${e.message}`); }
+  }
+}
+
+async function expireAlert(alert) {
+  const alertId = alert.id, userId = alert.userId;
+  if (alert._expiring) return;
+  alert._expiring = true;
+  log(`⏰ Alert expired: ${alertDesc(alert)} (${alertId}) user=${userId}`);
+  delete activeAlerts[alertId];                       // nothing can trigger it from now on
+  try { await rtdbDelete(`alerts/${userId}/${alertId}`); } catch (e) { warn(`  Expiry RTDB delete failed: ${e.message}`); }
+  try {
+    const token   = await getAccessToken();
+    const docUrl  = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/alerts/${userId}/active_alerts/alerts`;
+    const authHdr = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const readRes = await fetchJson(docUrl, { headers: authHdr });
+    if (readRes?.error) warn(`  Expiry Firestore read error: ${JSON.stringify(readRes.error)}`);
+    else {
+      const fields = { ...(readRes?.fields || {}) };
+      if (fields[alertId]) {
+        delete fields[alertId];
+        const w = await fetchJson(docUrl, { method: 'PATCH', headers: authHdr, body: JSON.stringify({ fields }) });
+        if (w?.error) warn(`  Expiry Firestore write-back error: ${JSON.stringify(w.error)}`);
+        else log(`  Firestore active_alerts field deleted (expired): ${alertId}`);
+      }
+    }
+  } catch (e) { warn(`  Expiry Firestore delete failed: ${e.message}`); }
+  await expiryDeleteVoices(userId, alertId);
+}
+
+function expirySweep() {
+  const now = Date.now();
+  for (const alert of Object.values(activeAlerts)) {
+    const at = Number(alert.expiresAt) || 0;
+    if (at > 0 && now >= at && !alert._expiring) expireAlert(alert).catch(e => warn(`expireAlert error: ${e.message}`));
+  }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // SECTION 10a2 — TRADE SETUP ALERTS (entry → take profit / stop loss)
 //
@@ -4011,6 +4069,7 @@ function startVoiceModule() {
   log(`🗣 ElevenLabs accounts configured: ${voiceKeys().length}`);
   setTimeout(() => voiceCreditsCheck(), 3000);
   setInterval(() => voiceCreditsCheck(), 5 * 60 * 1000);
+  setInterval(() => { try { expirySweep(); } catch (e) { warn(`expirySweep error: ${e.message}`); } }, 10000);
   setInterval(() => { try { voiceReconcile(); } catch (e) { warn(`voiceReconcile error: ${e.message}`); } }, 15000);
   setInterval(() => { voiceSweep().catch(e => warn(`voiceSweep error: ${e.message}`)); }, 60 * 1000);
   setTimeout(() => voiceSweepOrphans().catch(e => warn(`voiceSweepOrphans error: ${e.message}`)), 4 * 60 * 1000);
