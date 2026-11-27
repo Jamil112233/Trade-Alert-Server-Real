@@ -2149,7 +2149,7 @@ async function processSetupEntry(alert, price) {
 // ════════════════════════════════════════════════════════════════════════════
 // SECTION 10a4 — INDICATOR TRIAL (Trade Alert Pro: indicator alerts are a paid feature;
 //                each free account gets ONE trial alert)
-// users/{uid}.plan = "pro"  → unlimited indicator alerts
+// RTDB plans/{uid} = "pro"  → unlimited indicator alerts
 // users/{uid}.indicatorTrial = { used:true, alertId, usedAt }  → the one free alert (written ONLY here)
 // The app already blocks the create page when the credit is used; this is the part a cracked app
 // cannot skip: an indicator alert is monitored only if its owner is pro, or it IS the trial alert.
@@ -2172,7 +2172,14 @@ function trialAllowed(a) {
   return true;
 }
 
-/** users/{uid}: plan + trial { count, alertIds[] }  (older format { used:true, alertId } counts as 1 credit used). */
+/** Plan lives in RTDB plans/{uid} = "pro" | "free" (the app listens to it live; only the server / you write it). Missing = free. */
+async function readPlanPro(userId) {
+  const v = await rtdbGet(`plans/${userId}`);
+  if (v && typeof v === 'object' && v.error) throw new Error(`plan read failed: ${v.error}`);
+  return v === 'pro';
+}
+
+/** users/{uid}: trial { count, alertIds[] }  (older format { used:true, alertId } counts as 1 credit used). */
 async function trialReadUser(userId) {
   const token = await getAccessToken();
   const doc = await fetchJson(
@@ -2187,7 +2194,6 @@ async function trialReadUser(userId) {
   const legacyUsed = !!(t.used && t.used.booleanValue);
   const cnt = t.count && t.count.integerValue ? parseInt(t.count.integerValue, 10) : 0;
   return {
-    pro:     f.plan && f.plan.stringValue === 'pro',
     count:   Math.max(cnt, ids.length, legacyUsed ? 1 : 0),
     ids,
     docEmail: (f.email && f.email.stringValue) || ''
@@ -2254,8 +2260,8 @@ async function trialWriteUsage(email, userId, count) {
 
 async function trialDecide(alert) {
   const userId = alert.userId, alertId = alert.id;
+  if (await readPlanPro(userId)) { trialDecisions.set(alertId, { ok: true, pro: true }); return; }
   const u = await trialReadUser(userId);
-  if (u.pro) { trialDecisions.set(alertId, { ok: true, pro: true }); return; }
   const email = await trialEmailOf(userId, u.docEmail);
   const usage = email ? await trialReadUsage(email) : { count: 0 };         // throws on a read error → retried, never guessed
   if (u.ids.includes(alertId)) {                                              // already one of this account's trial alerts (restart / edit)
@@ -3681,7 +3687,7 @@ function voiceHash(str) { return require('crypto').createHash('sha256').update(s
 function voiceSeed(text) { return parseInt(require('crypto').createHash('sha256').update(text).digest('hex').slice(0, 8), 16); }
 
 // ── Voice announcement is a PRO feature: the server only spends ElevenLabs credits for Pro accounts ──────────
-// users/{uid}.plan === "pro". Cached (Pro 5 min / not-pro 1 min), refreshed in the background. null = not known yet:
+// RTDB plans/{uid} === "pro". Cached (Pro 5 min / not-pro 1 min), refreshed in the background. null = not known yet:
 // nothing is generated while unknown, but nothing is deleted either (a Firestore hiccup must never wipe voices).
 // VOICE_PRO_ENFORCE=0 (env) turns the check off.
 const VOICE_PRO_ENFORCE = process.env.VOICE_PRO_ENFORCE !== '0';
@@ -3692,8 +3698,8 @@ function userIsPro(uid) {
   if (c && Date.now() - c.at < (c.pro ? 300000 : 60000)) return c.pro;
   if (!planFetching.has(uid)) {
     planFetching.add(uid);
-    trialReadUser(uid)
-      .then(u => { const changed = !c || c.pro !== !!u.pro; planCache.set(uid, { pro: !!u.pro, at: Date.now() }); if (changed) setTimeout(() => { try { voiceReconcile(); } catch (e) {} }, 0); })
+    readPlanPro(uid)
+      .then(pro => { const changed = !c || c.pro !== pro; planCache.set(uid, { pro, at: Date.now() }); if (changed) setTimeout(() => { try { voiceReconcile(); } catch (e) {} }, 0); })
       .catch(e => warn(`plan lookup failed for ${uid}: ${e.message}`))
       .finally(() => planFetching.delete(uid));
   }
