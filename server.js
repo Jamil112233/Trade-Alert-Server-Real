@@ -1371,6 +1371,7 @@ function checkAlerts() {
       if (alert.enabled === false) continue; // paused by the user (repeating alerts only)
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
       if (alert.alertKind === 'indicator') continue; // EMA alerts → Section 12 (indicator engine)
+      if (alert.setup === true && !trialAllowed(alert)) continue;   // Trade Setup is a paid feature: pro / trial credit only (Section 10a4)
       // TRADE SETUP: while waiting for the ENTRY a candle-close setup is handled at the minute boundary; once the entry is
       // taken, take profit / stop loss are always plain price touches (no candle-close option), so they come through here.
       const setupLive = alert.setup === true && !!alert.setupEntered;
@@ -1629,7 +1630,8 @@ async function onMinuteClose() {
 function checkCandleCloseAlerts(closedTfs) {
   const all       = Object.values(activeAlerts);
   const alertList = all.filter(a => a.candleClose && a.alertKind !== 'indicator' && closedTfs.includes(a.timeframe)
-                                    && !(a.setup === true && a.setupEntered));   // entered setups: TP/SL are price touches (checkAlerts)
+                                    && !(a.setup === true && a.setupEntered)   // entered setups: TP/SL are price touches (checkAlerts)
+                                    && !(a.setup === true && !trialAllowed(a)));   // paid feature: pro / trial credit only
 
   log(`  checkCandleCloseAlerts: ${alertCountsText(all)}, ${alertList.length} match [${closedTfs.join(',')}]`);
   all.filter(a => a.candleClose && a.alertKind !== 'indicator').forEach(a =>
@@ -2147,8 +2149,8 @@ async function processSetupEntry(alert, price) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SECTION 10a4 — INDICATOR TRIAL (Trade Alert Pro: indicator alerts are a paid feature;
-//                each free account gets ONE trial alert)
+// SECTION 10a4 — FREE TRIAL CREDITS (Trade Alert Pro: indicator alerts and Trade Setup alerts are paid features;
+//                every free account gets a few trial alerts of each: indicator 5, trade setup 2)
 // RTDB plans/{uid} = "pro"  → unlimited indicator alerts
 // users/{uid}.indicatorTrial = { used:true, alertId, usedAt }  → the one free alert (written ONLY here)
 // The app already blocks the create page when the credit is used; this is the part a cracked app
@@ -2159,16 +2161,31 @@ async function processSetupEntry(alert, price) {
 // ════════════════════════════════════════════════════════════════════════════
 const TRIAL_ENFORCE = process.env.INDICATOR_TRIAL_ENFORCE !== '0';
 const TRIAL_LIMIT   = Math.max(1, parseInt(process.env.INDICATOR_TRIAL_LIMIT || '5', 10) || 5);   // free indicator alerts per account (keep in step with IndicatorAccess.TRIAL_LIMIT in the app)
+const SETUP_TRIAL_LIMIT = Math.max(1, parseInt(process.env.SETUP_TRIAL_LIMIT || '2', 10) || 2);   // free Trade Setup alerts per account (keep in step with IndicatorAccess.SETUP_LIMIT)
+// One trial system, two paid features. Same rules for both: credit spent when the alert is created, never refunded.
+const TRIAL_FEATURES = {
+  indicator: { field: 'indicatorTrial', cntField: 'indicatorCount', usedField: 'indicatorUsed', limit: TRIAL_LIMIT,       label: 'Indicator' },
+  setup:     { field: 'setupTrial',     cntField: 'setupCount',     usedField: 'setupUsed',     limit: SETUP_TRIAL_LIMIT, label: 'Trade Setup' }
+};
+function trialFeatureOf(a) {
+  if (!a) return null;
+  if (a.alertKind === 'indicator') return 'indicator';
+  if (a.setup === true) return 'setup';
+  return null;
+}
 const trialDecisions = new Map();   // alertId -> { ok, pro }
 const trialPending   = new Set();   // alertIds being decided right now
 const trialUserChain = new Map();   // userId -> promise (one decision at a time per user: no double claim)
 
-/** Used by the indicator engine (indIsValid): may this indicator alert be monitored? */
+/** May this paid-feature alert (indicator / trade setup) be monitored? */
 function trialAllowed(a) {
   if (!TRIAL_ENFORCE) return true;
+  const f = trialFeatureOf(a);
+  if (!f) return true;
+  if (f === 'setup' && a.setupEntered) return true;               // an open trade is always watched (TP/SL), whatever happens to the plan
   const d = trialDecisions.get(a.id);
   if (!d || !d.ok) return false;                                  // undecided yet (≤2 s) or denied
-  if (!d.pro && a.alertMode === 'repeating') return false;        // trial alerts must be "once"
+  if (f === 'indicator' && !d.pro && a.alertMode === 'repeating') return false;   // trial indicator alerts must be "once"
   return true;
 }
 
@@ -2179,15 +2196,16 @@ async function readPlanPro(userId) {
   return v === 'pro';
 }
 
-/** users/{uid}: trial { count, alertIds[] }  (older format { used:true, alertId } counts as 1 credit used). */
-async function trialReadUser(userId) {
+/** users/{uid}.<feature>Trial: trial { count, alertIds[] }  (older indicator format { used:true, alertId } counts as 1 credit used). */
+async function trialReadUser(userId, featKey) {
+  const feat = TRIAL_FEATURES[featKey || 'indicator'];
   const token = await getAccessToken();
   const doc = await fetchJson(
     `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}`,
     { headers: { 'Authorization': `Bearer ${token}` } });
   if (doc && doc.error && doc.error.code !== 404) throw new Error(doc.error.message || 'firestore read failed');
   const f = (doc && doc.fields) || {};
-  const t = f.indicatorTrial && f.indicatorTrial.mapValue && f.indicatorTrial.mapValue.fields || {};
+  const t = f[feat.field] && f[feat.field].mapValue && f[feat.field].mapValue.fields || {};
   const ids = ((t.alertIds && t.alertIds.arrayValue && t.alertIds.arrayValue.values) || []).map(v => v.stringValue).filter(Boolean);
   const legacyId = (t.alertId && t.alertId.stringValue) || '';
   if (legacyId && !ids.includes(legacyId)) ids.push(legacyId);
@@ -2200,12 +2218,13 @@ async function trialReadUser(userId) {
   };
 }
 
-async function trialClaim(userId, ids, count) {
+async function trialClaim(userId, featKey, ids, count) {
+  const feat = TRIAL_FEATURES[featKey];
   const token = await getAccessToken();
   const res = await fetchJson(
-    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}?updateMask.fieldPaths=indicatorTrial`,
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}?updateMask.fieldPaths=${feat.field}`,
     { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}` },
-      body: JSON.stringify({ fields: { indicatorTrial: { mapValue: { fields: {
+      body: JSON.stringify({ fields: { [feat.field]: { mapValue: { fields: {
         count:    { integerValue: String(count) },
         alertIds: { arrayValue: { values: ids.slice(-20).map(x => ({ stringValue: x })) } },
         usedAt:   { integerValue: String(Date.now()) } } } } } }) });
@@ -2233,70 +2252,75 @@ async function trialEmailOf(userId, docEmail) {
   return email;
 }
 
-async function trialReadUsage(email) {
+async function trialReadUsage(email, featKey) {
+  const feat = TRIAL_FEATURES[featKey];
   const token = await getAccessToken();
   const doc = await fetchJson(
     `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}`,
     { headers: { 'Authorization': `Bearer ${token}` } });
   if (doc && doc.error && doc.error.code !== 404) throw new Error(doc.error.message || 'usage read failed');
   const f = (doc && doc.fields) || {};
-  const cnt = f.indicatorCount && f.indicatorCount.integerValue ? parseInt(f.indicatorCount.integerValue, 10) : 0;
-  return { count: Math.max(cnt, (f.indicatorUsed && f.indicatorUsed.booleanValue) ? 1 : 0) };
+  const cnt = f[feat.cntField] && f[feat.cntField].integerValue ? parseInt(f[feat.cntField].integerValue, 10) : 0;
+  return { count: Math.max(cnt, (f[feat.usedField] && f[feat.usedField].booleanValue) ? 1 : 0) };
 }
 
-async function trialWriteUsage(email, userId, count) {
+async function trialWriteUsage(email, userId, featKey, count) {
+  const feat = TRIAL_FEATURES[featKey];
   const token = await getAccessToken();
   const res = await fetchJson(
-    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}?updateMask.fieldPaths=indicatorUsed&updateMask.fieldPaths=indicatorCount&updateMask.fieldPaths=indicatorUsedAt&updateMask.fieldPaths=email&updateMask.fieldPaths=lastUid`,
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}?updateMask.fieldPaths=${feat.usedField}&updateMask.fieldPaths=${feat.cntField}&updateMask.fieldPaths=${featKey}UsedAt&updateMask.fieldPaths=email&updateMask.fieldPaths=lastUid`,
     { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}` },
       body: JSON.stringify({ fields: {
-        indicatorUsed:    { booleanValue: count >= TRIAL_LIMIT },
-        indicatorCount:   { integerValue: String(count) },
-        indicatorUsedAt:  { integerValue: String(Date.now()) },
-        email:            { stringValue: email },
-        lastUid:          { stringValue: userId } } }) });
+        [feat.usedField]:  { booleanValue: count >= feat.limit },
+        [feat.cntField]:   { integerValue: String(count) },
+        [`${featKey}UsedAt`]: { integerValue: String(Date.now()) },
+        email:             { stringValue: email },
+        lastUid:           { stringValue: userId } } }) });
   if (res && res.error) throw new Error(res.error.message || 'usage write failed');
 }
 
-async function trialDecide(alert) {
+async function trialDecide(alert, featKey) {
+  const feat = TRIAL_FEATURES[featKey];
   const userId = alert.userId, alertId = alert.id;
   if (await readPlanPro(userId)) { trialDecisions.set(alertId, { ok: true, pro: true }); return; }
-  const u = await trialReadUser(userId);
+  const u = await trialReadUser(userId, featKey);
   const email = await trialEmailOf(userId, u.docEmail);
-  const usage = email ? await trialReadUsage(email) : { count: 0 };         // throws on a read error → retried, never guessed
-  if (u.ids.includes(alertId)) {                                              // already one of this account's trial alerts (restart / edit)
+  const usage = email ? await trialReadUsage(email, featKey) : { count: 0 };   // throws on a read error → retried, never guessed
+  if (u.ids.includes(alertId)) {                                                 // already one of this account's trial alerts (restart / edit)
     trialDecisions.set(alertId, { ok: true, pro: false });
-    if (email && usage.count < u.count) trialWriteUsage(email, userId, u.count).catch(e => warn(`trial: usage backfill failed (${e.message})`));
+    if (email && usage.count < u.count) trialWriteUsage(email, userId, featKey, u.count).catch(e => warn(`trial: usage backfill failed (${e.message})`));
     return;
   }
   const used = Math.max(u.count, usage.count);
-  if (used < TRIAL_LIMIT) {
+  if (used < feat.limit) {
     const ids = [...u.ids, alertId], newCount = used + 1;
     // write both records, then READ THEM BACK — a credit only counts once Firestore really holds it (retries; if it still
     // cannot be confirmed we throw: no decision is stored, the alert stays unmonitored and the next sweep tries again)
-    const saved = await withVerifiedRetry(`Indicator trial claim (${userId})`, async () => {
-      await trialClaim(userId, ids, newCount);
-      if (email) await trialWriteUsage(email, userId, newCount);
-      const chk = await trialReadUser(userId);
-      const chk2 = email ? await trialReadUsage(email) : { count: newCount };
+    const saved = await withVerifiedRetry(`${feat.label} trial claim (${userId})`, async () => {
+      await trialClaim(userId, featKey, ids, newCount);
+      if (email) await trialWriteUsage(email, userId, featKey, newCount);
+      const chk = await trialReadUser(userId, featKey);
+      const chk2 = email ? await trialReadUsage(email, featKey) : { count: newCount };
       return chk.ids.includes(alertId) && chk.count >= newCount && chk2.count >= newCount;
     }, 3, 1000);
     if (!saved) throw new Error(`could not confirm trial credit for ${userId}`);
     trialDecisions.set(alertId, { ok: true, pro: false });
-    log(`🎟️ Indicator trial credit ${newCount}/${TRIAL_LIMIT} used: user=${userId} alert=${alertId} (${alert.pairSymbol})`);
+    log(`🎟️ ${feat.label} trial credit ${newCount}/${feat.limit} used: user=${userId} alert=${alertId} (${alert.pairSymbol})`);
     return;
   }
   trialDecisions.set(alertId, { ok: false, pro: false });
-  warn(`🚫 Indicator alert not allowed (${TRIAL_LIMIT}/${TRIAL_LIMIT} trial credits used${usage.count > u.count ? ' on this email' : ''}, not pro): user=${userId} alert=${alertId}${TRIAL_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
+  warn(`🚫 ${feat.label} alert not allowed (${feat.limit}/${feat.limit} trial credits used${usage.count > u.count ? ' on this email' : ''}, not pro): user=${userId} alert=${alertId}${TRIAL_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
 }
 
 function trialSweep() {
   for (const id of trialDecisions.keys()) if (!activeAlerts[id]) trialDecisions.delete(id);   // forget removed alerts
   for (const a of Object.values(activeAlerts)) {
-    if (!a || a.alertKind !== 'indicator' || !a.userId || trialDecisions.has(a.id) || trialPending.has(a.id)) continue;
+    const fk = trialFeatureOf(a);
+    if (!a || !fk || !a.userId || trialDecisions.has(a.id) || trialPending.has(a.id)) continue;
+    if (fk === 'setup' && a.setupEntered) continue;                              // open trades are exempt (never need a decision)
     trialPending.add(a.id);
     const prev = trialUserChain.get(a.userId) || Promise.resolve();
-    const next = prev.then(() => trialDecide(a))
+    const next = prev.then(() => trialDecide(a, fk))
       .catch(e => warn(`trialDecide error (will retry): ${e.message}`))
       .finally(() => { trialPending.delete(a.id); if (trialUserChain.get(a.userId) === next) trialUserChain.delete(a.userId); });
     trialUserChain.set(a.userId, next);
