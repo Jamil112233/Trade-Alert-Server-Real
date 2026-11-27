@@ -2147,6 +2147,86 @@ async function processSetupEntry(alert, price) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SECTION 10a4 — INDICATOR TRIAL (Trade Alert Pro: indicator alerts are a paid feature;
+//                each free account gets ONE trial alert)
+// users/{uid}.plan = "pro"  → unlimited indicator alerts
+// users/{uid}.indicatorTrial = { used:true, alertId, usedAt }  → the one free alert (written ONLY here)
+// The app already blocks the create page when the credit is used; this is the part a cracked app
+// cannot skip: an indicator alert is monitored only if its owner is pro, or it IS the trial alert.
+// Alerts that are not allowed are simply ignored (never deleted). A free account's trial alert must
+// be "once" (a repeating trial alert would run for free forever).
+// INDICATOR_TRIAL_ENFORCE=0 (env) → everything still gets claimed/logged, but nothing is blocked.
+// ════════════════════════════════════════════════════════════════════════════
+const TRIAL_ENFORCE = process.env.INDICATOR_TRIAL_ENFORCE !== '0';
+const trialDecisions = new Map();   // alertId -> { ok, pro }
+const trialPending   = new Set();   // alertIds being decided right now
+const trialUserChain = new Map();   // userId -> promise (one decision at a time per user: no double claim)
+
+/** Used by the indicator engine (indIsValid): may this indicator alert be monitored? */
+function trialAllowed(a) {
+  if (!TRIAL_ENFORCE) return true;
+  const d = trialDecisions.get(a.id);
+  if (!d || !d.ok) return false;                                  // undecided yet (≤2 s) or denied
+  if (!d.pro && a.alertMode === 'repeating') return false;        // trial alert must be "once"
+  return true;
+}
+
+async function trialReadUser(userId) {
+  const token = await getAccessToken();
+  const doc = await fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}`,
+    { headers: { 'Authorization': `Bearer ${token}` } });
+  if (doc && doc.error && doc.error.code !== 404) throw new Error(doc.error.message || 'firestore read failed');
+  const f = (doc && doc.fields) || {};
+  const t = f.indicatorTrial && f.indicatorTrial.mapValue && f.indicatorTrial.mapValue.fields || {};
+  return {
+    pro:     f.plan && f.plan.stringValue === 'pro',
+    used:    !!(t.used && t.used.booleanValue),
+    alertId: (t.alertId && t.alertId.stringValue) || ''
+  };
+}
+
+async function trialClaim(userId, alertId) {
+  const token = await getAccessToken();
+  const res = await fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}?updateMask.fieldPaths=indicatorTrial`,
+    { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ fields: { indicatorTrial: { mapValue: { fields: {
+        used:    { booleanValue: true },
+        alertId: { stringValue: alertId },
+        usedAt:  { integerValue: String(Date.now()) } } } } } }) });
+  if (res && res.error) throw new Error(res.error.message || 'firestore write failed');
+}
+
+async function trialDecide(alert) {
+  const userId = alert.userId, alertId = alert.id;
+  const u = await trialReadUser(userId);
+  if (u.pro)                    { trialDecisions.set(alertId, { ok: true, pro: true });  return; }
+  if (u.alertId === alertId)    { trialDecisions.set(alertId, { ok: true, pro: false }); return; }   // already the trial alert (restart/edit)
+  if (!u.used) {
+    await trialClaim(userId, alertId);
+    trialDecisions.set(alertId, { ok: true, pro: false });
+    log(`🎟️ Indicator trial used: user=${userId} alert=${alertId} (${alert.pairSymbol})`);
+    return;
+  }
+  trialDecisions.set(alertId, { ok: false, pro: false });
+  warn(`🚫 Indicator alert not allowed (trial already used, not pro): user=${userId} alert=${alertId}${TRIAL_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
+}
+
+function trialSweep() {
+  for (const id of trialDecisions.keys()) if (!activeAlerts[id]) trialDecisions.delete(id);   // forget removed alerts
+  for (const a of Object.values(activeAlerts)) {
+    if (!a || a.alertKind !== 'indicator' || !a.userId || trialDecisions.has(a.id) || trialPending.has(a.id)) continue;
+    trialPending.add(a.id);
+    const prev = trialUserChain.get(a.userId) || Promise.resolve();
+    const next = prev.then(() => trialDecide(a))
+      .catch(e => warn(`trialDecide error (will retry): ${e.message}`))
+      .finally(() => { trialPending.delete(a.id); if (trialUserChain.get(a.userId) === next) trialUserChain.delete(a.userId); });
+    trialUserChain.set(a.userId, next);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // SECTION 10b — REPEATING ALERT TRIGGER PROCESSING
 //
 // Differs from processTriggeredAlert() in the important way: the alert is
@@ -2655,6 +2735,7 @@ function indSetupSig(a) { return `${a.indicatorType}|${a.indicatorMode}|${indTar
 /** True when this alert is an EMA alert (single or crossover) this engine can monitor. */
 function indIsValid(a) {
   if (!a || a.alertKind !== 'indicator' || !IND_TYPES.has(a.indicatorType)) return false;
+  if (!trialAllowed(a)) return false;                                      // paid feature: trial / pro only (Section 10a4)
   if (a.indicatorMode !== 'single' && a.indicatorMode !== 'crossover') return false;
   if (!IND_TF_MS[a.timeframe] || !indSource(a.pairSymbol)) return false;
   if (a.indicatorType === 'vwap') return a.indicatorMode === 'single' && indSource(a.pairSymbol) === 'gate';   // VWAP: no inputs, crypto only (real volume)
@@ -4071,6 +4152,9 @@ function startVoiceModule() {
   setTimeout(() => voiceCreditsCheck(), 3000);
   setInterval(() => voiceCreditsCheck(), 5 * 60 * 1000);
   setInterval(() => { try { expirySweep(); } catch (e) { warn(`expirySweep error: ${e.message}`); } }, 10000);
+
+  // Indicator trial: decide (claim the free credit / check pro) for every new indicator alert
+  setInterval(() => { try { trialSweep(); } catch (e) { warn(`trialSweep error: ${e.message}`); } }, 2000);
   setInterval(() => { try { voiceReconcile(); } catch (e) { warn(`voiceReconcile error: ${e.message}`); } }, 15000);
   setInterval(() => { voiceSweep().catch(e => warn(`voiceSweep error: ${e.message}`)); }, 60 * 1000);
   setTimeout(() => voiceSweepOrphans().catch(e => warn(`voiceSweepOrphans error: ${e.message}`)), 4 * 60 * 1000);
