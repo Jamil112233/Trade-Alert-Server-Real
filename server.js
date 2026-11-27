@@ -2182,8 +2182,54 @@ async function trialReadUser(userId) {
   return {
     pro:     f.plan && f.plan.stringValue === 'pro',
     used:    !!(t.used && t.used.booleanValue),
-    alertId: (t.alertId && t.alertId.stringValue) || ''
+    alertId: (t.alertId && t.alertId.stringValue) || '',
+    docEmail: (f.email && f.email.stringValue) || ''
   };
+}
+
+// ── users_usage/{email}: survives account deletion, so deleting the account and signing up again with
+//    the same email does not give a second free trial. Written ONLY by this server. ──────────────────
+const TRIAL_USAGE_COLLECTION = 'users_usage';
+const trialEmailCache = new Map();   // userId -> email
+
+/** Trusted email of the account (Firebase Auth lookup); falls back to the email saved on the user doc. */
+async function trialEmailOf(userId, docEmail) {
+  if (trialEmailCache.has(userId)) return trialEmailCache.get(userId);
+  let email = '';
+  try {
+    const token = await getAccessToken();
+    const r = await fetchJson(`https://identitytoolkit.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/accounts:lookup`,
+      { method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: JSON.stringify({ localId: [userId] }) });
+    email = (r && r.users && r.users[0] && r.users[0].email) || '';
+  } catch (e) { warn(`trial: auth email lookup failed (${e.message})`); }
+  if (!email) email = docEmail || '';
+  email = String(email).trim().toLowerCase();
+  if (email) trialEmailCache.set(userId, email);
+  return email;
+}
+
+async function trialReadUsage(email) {
+  const token = await getAccessToken();
+  const doc = await fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}`,
+    { headers: { 'Authorization': `Bearer ${token}` } });
+  if (doc && doc.error && doc.error.code !== 404) throw new Error(doc.error.message || 'usage read failed');
+  const f = (doc && doc.fields) || {};
+  return { used: !!(f.indicatorUsed && f.indicatorUsed.booleanValue) };
+}
+
+async function trialWriteUsage(email, userId, alertId) {
+  const token = await getAccessToken();
+  const res = await fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}?updateMask.fieldPaths=indicatorUsed&updateMask.fieldPaths=indicatorUsedAt&updateMask.fieldPaths=email&updateMask.fieldPaths=lastUid&updateMask.fieldPaths=indicatorAlertId`,
+    { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ fields: {
+        indicatorUsed:    { booleanValue: true },
+        indicatorUsedAt:  { integerValue: String(Date.now()) },
+        email:            { stringValue: email },
+        lastUid:          { stringValue: userId },
+        indicatorAlertId: { stringValue: alertId } } }) });
+  if (res && res.error) throw new Error(res.error.message || 'usage write failed');
 }
 
 async function trialClaim(userId, alertId) {
@@ -2201,15 +2247,23 @@ async function trialClaim(userId, alertId) {
 async function trialDecide(alert) {
   const userId = alert.userId, alertId = alert.id;
   const u = await trialReadUser(userId);
-  if (u.pro)                    { trialDecisions.set(alertId, { ok: true, pro: true });  return; }
-  if (u.alertId === alertId)    { trialDecisions.set(alertId, { ok: true, pro: false }); return; }   // already the trial alert (restart/edit)
-  if (!u.used) {
-    // write, then READ IT BACK — the credit only counts once Firestore really holds it (retries; if it still
+  if (u.pro) { trialDecisions.set(alertId, { ok: true, pro: true }); return; }
+  const email = await trialEmailOf(userId, u.docEmail);
+  const usage = email ? await trialReadUsage(email) : { used: false };      // throws on a read error → retried, never guessed
+  if (u.alertId === alertId) {                                                // already THE trial alert (restart / edit)
+    trialDecisions.set(alertId, { ok: true, pro: false });
+    if (email && !usage.used) trialWriteUsage(email, userId, alertId).catch(e => warn(`trial: usage backfill failed (${e.message})`));   // older trials get recorded too
+    return;
+  }
+  if (!u.used && !usage.used) {
+    // write both records, then READ THEM BACK — the credit only counts once Firestore really holds it (retries; if it still
     // cannot be confirmed we throw: no decision is stored, the alert stays unmonitored and the next sweep tries again)
     const saved = await withVerifiedRetry(`Indicator trial claim (${userId})`, async () => {
       await trialClaim(userId, alertId);
+      if (email) await trialWriteUsage(email, userId, alertId);
       const chk = await trialReadUser(userId);
-      return chk.used && chk.alertId === alertId;
+      const chk2 = email ? await trialReadUsage(email) : { used: true };
+      return chk.used && chk.alertId === alertId && chk2.used;
     }, 3, 1000);
     if (!saved) throw new Error(`could not confirm trial credit for ${userId}`);
     trialDecisions.set(alertId, { ok: true, pro: false });
@@ -2217,7 +2271,7 @@ async function trialDecide(alert) {
     return;
   }
   trialDecisions.set(alertId, { ok: false, pro: false });
-  warn(`🚫 Indicator alert not allowed (trial already used, not pro): user=${userId} alert=${alertId}${TRIAL_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
+  warn(`🚫 Indicator alert not allowed (trial already used${usage.used && !u.used ? ' on this email' : ''}, not pro): user=${userId} alert=${alertId}${TRIAL_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
 }
 
 function trialSweep() {
