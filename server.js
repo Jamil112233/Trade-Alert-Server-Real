@@ -3670,8 +3670,29 @@ function voiceBuildText(a) {
 function voiceHash(str) { return require('crypto').createHash('sha256').update(str).digest('hex').slice(0, 16); }
 function voiceSeed(text) { return parseInt(require('crypto').createHash('sha256').update(text).digest('hex').slice(0, 8), 16); }
 
+// ── Voice announcement is a PRO feature: the server only spends ElevenLabs credits for Pro accounts ──────────
+// users/{uid}.plan === "pro". Cached (Pro 5 min / not-pro 1 min), refreshed in the background. null = not known yet:
+// nothing is generated while unknown, but nothing is deleted either (a Firestore hiccup must never wipe voices).
+// VOICE_PRO_ENFORCE=0 (env) turns the check off.
+const VOICE_PRO_ENFORCE = process.env.VOICE_PRO_ENFORCE !== '0';
+const planCache = new Map();        // userId -> { pro, at }
+const planFetching = new Set();
+function userIsPro(uid) {
+  const c = planCache.get(uid);
+  if (c && Date.now() - c.at < (c.pro ? 300000 : 60000)) return c.pro;
+  if (!planFetching.has(uid)) {
+    planFetching.add(uid);
+    trialReadUser(uid)
+      .then(u => { const changed = !c || c.pro !== !!u.pro; planCache.set(uid, { pro: !!u.pro, at: Date.now() }); if (changed) setTimeout(() => { try { voiceReconcile(); } catch (e) {} }, 0); })
+      .catch(e => warn(`plan lookup failed for ${uid}: ${e.message}`))
+      .finally(() => planFetching.delete(uid));
+  }
+  return c ? c.pro : null;
+}
+
 function voiceEligible(id, a) {
   return !!a && VOICE_SAFE_ID.test(id) && VOICE_SAFE_ID.test(String(a.userId || '')) &&
+         (!VOICE_PRO_ENFORCE || userIsPro(String(a.userId)) !== false) &&
          (a.voiceAlarm === true || a.voiceAlarm === 'true') && a.alarm === true &&
          (a.alertKind === 'indicator'
             ? (typeof indIsValid !== 'function' || indIsValid(a))              // indicator alert the engine can monitor
@@ -4008,6 +4029,7 @@ function voiceReconcile() {
     const have = voiceMeta.get(mk);
     if (have && have.textHash === job.textHash) continue;
     if (voiceInflight.has(mk) || queued.has(mk)) continue;
+    if (VOICE_PRO_ENFORCE && userIsPro(job.uid) !== true) continue;          // Pro feature — nothing generated for free accounts
     const f = voiceFails.get(mk);
     if (f && (f.nextAt > Date.now() || f.n >= VOICE_RETRY_MS.length)) continue;
     voiceQueue.push(job);
