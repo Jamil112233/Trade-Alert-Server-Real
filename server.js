@@ -2204,7 +2204,14 @@ async function trialDecide(alert) {
   if (u.pro)                    { trialDecisions.set(alertId, { ok: true, pro: true });  return; }
   if (u.alertId === alertId)    { trialDecisions.set(alertId, { ok: true, pro: false }); return; }   // already the trial alert (restart/edit)
   if (!u.used) {
-    await trialClaim(userId, alertId);
+    // write, then READ IT BACK — the credit only counts once Firestore really holds it (retries; if it still
+    // cannot be confirmed we throw: no decision is stored, the alert stays unmonitored and the next sweep tries again)
+    const saved = await withVerifiedRetry(`Indicator trial claim (${userId})`, async () => {
+      await trialClaim(userId, alertId);
+      const chk = await trialReadUser(userId);
+      return chk.used && chk.alertId === alertId;
+    }, 3, 1000);
+    if (!saved) throw new Error(`could not confirm trial credit for ${userId}`);
     trialDecisions.set(alertId, { ok: true, pro: false });
     log(`🎟️ Indicator trial used: user=${userId} alert=${alertId} (${alert.pairSymbol})`);
     return;
