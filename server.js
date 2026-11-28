@@ -2179,6 +2179,7 @@ const trialUserChain = new Map();   // userId -> promise (one decision at a time
 
 /** May this paid-feature alert (indicator / trade setup) be monitored? */
 function trialAllowed(a) {
+  if (ACTIVE_ENFORCE && activeDenied.has(a.id)) return false;      // over the max-active-alerts limit (free accounts)
   if (DAILY_ENFORCE && dailyDenied.has(a.id)) return false;       // over the daily creation limit (denied alerts are ignored, never deleted)
   if (!TRIAL_ENFORCE) return true;
   const f = trialFeatureOf(a);
@@ -2328,6 +2329,37 @@ const DAILY_LIMIT   = Math.max(1, parseInt(process.env.DAILY_ALERT_LIMIT || '20'
 const DAILY_ENFORCE = process.env.DAILY_LIMIT_ENFORCE !== '0';
 const DAILY_WINDOW_MS = 48 * 3600 * 1000;
 const dailyDenied = new Set();                 // alertIds over the limit
+
+// ── MAX ACTIVE ALERTS (free accounts) ──────────────────────────────────────
+// • Free accounts may have ACTIVE_ALERT_LIMIT (default 8) active alerts; Pro = unlimited. All alert types, paused repeating ones count.
+// • Only alerts carrying `dayKey` (created by the Pro app) can be denied; legacy Beta alerts are grandfathered (always count, never denied).
+// • Recomputed from scratch every sweep: delete/trigger an alert -> the next one is allowed again. Denied alerts are ignored, never deleted.
+// • Unknown plan (null) = fail-open. ACTIVE_LIMIT_ENFORCE=0 -> only logs.
+const ACTIVE_LIMIT   = Math.max(1, parseInt(process.env.ACTIVE_ALERT_LIMIT || '8', 10) || 8);
+const ACTIVE_ENFORCE = process.env.ACTIVE_LIMIT_ENFORCE !== '0';
+let activeDenied = new Set();
+
+function activeRecompute() {
+  const byUser = new Map();
+  for (const a of Object.values(activeAlerts)) {
+    if (!a || !a.id || !a.userId) continue;
+    let l = byUser.get(a.userId); if (!l) byUser.set(a.userId, l = []);
+    l.push(a);
+  }
+  const next = new Set();
+  for (const [uid, list] of byUser) {
+    if (list.length <= ACTIVE_LIMIT) continue;
+    if ((typeof userIsPro === 'function' ? userIsPro(uid) : null) !== false) continue;   // Pro or unknown: no limit
+    list.sort((x, y) => ((+x.createdAt || 0) - (+y.createdAt || 0)) || String(x.id).localeCompare(String(y.id)));
+    let allowed = 0;
+    for (const a of list) {
+      if (!a.dayKey) { allowed++; continue; }                       // legacy: always counts, never denied
+      if (allowed >= ACTIVE_LIMIT) next.add(a.id); else allowed++;
+    }
+  }
+  for (const id of next) if (!activeDenied.has(id)) log(`🚫 Active limit (${ACTIVE_LIMIT}) — alert ${id} ignored${ACTIVE_ENFORCE ? '' : ' (log only)'}`);
+  activeDenied = next;
+}
 const dailyProfileCache = new Map();           // userId -> { pro, limited, email, at }
 
 const utcDay = ms => new Date(ms).toISOString().slice(0, 10);
@@ -2427,9 +2459,11 @@ async function decideAlert(a, fk) {
 function trialSweep() {
   for (const id of trialDecisions.keys()) if (!activeAlerts[id]) trialDecisions.delete(id);   // forget removed alerts
   for (const id of dailyDenied) if (!activeAlerts[id]) dailyDenied.delete(id);
+  try { activeRecompute(); } catch (e) { warn(`activeRecompute: ${e.message}`); }
   for (const a of Object.values(activeAlerts)) {
     const fk = trialFeatureOf(a);
     if (!a || !a.userId || trialDecisions.has(a.id) || trialPending.has(a.id)) continue;
+    if (ACTIVE_ENFORCE && activeDenied.has(a.id)) continue;                      // over the active limit: no daily / trial credit spent
     if (!fk && !dailyIsRecent(a)) continue;                                      // old plain alert: nothing to decide
     if (fk === 'setup' && a.setupEntered) continue;                              // open trades are exempt (never need a decision)
     trialPending.add(a.id);
