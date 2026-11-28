@@ -2337,6 +2337,8 @@ const dailyDenied = new Set();                 // alertIds over the limit
 // • Unknown plan (null) = fail-open. ACTIVE_LIMIT_ENFORCE=0 -> only logs.
 const ACTIVE_LIMIT   = Math.max(1, parseInt(process.env.ACTIVE_ALERT_LIMIT || '8', 10) || 8);
 const ACTIVE_ENFORCE = process.env.ACTIVE_LIMIT_ENFORCE !== '0';
+// • Repeating: free accounts may have REPEAT_ALERT_LIMIT (default 2) ACTIVE repeating alerts (paused ones don't count); same grandfathering rules.
+const REPEAT_LIMIT = Math.max(1, parseInt(process.env.REPEAT_ALERT_LIMIT || '2', 10) || 2);
 let activeDenied = new Set();
 
 function activeRecompute() {
@@ -2347,17 +2349,26 @@ function activeRecompute() {
     l.push(a);
   }
   const next = new Set();
+  const isRep = a => a.alertMode === 'repeating' && a.enabled !== false;      // active (not paused) repeating alert
+  const byAge = (x, y) => ((+x.createdAt || 0) - (+y.createdAt || 0)) || String(x.id).localeCompare(String(y.id));
   for (const [uid, list] of byUser) {
-    if (list.length <= ACTIVE_LIMIT) continue;
+    if (list.length <= ACTIVE_LIMIT && list.filter(isRep).length <= REPEAT_LIMIT) continue;
     if ((typeof userIsPro === 'function' ? userIsPro(uid) : null) !== false) continue;   // Pro or unknown: no limit
-    list.sort((x, y) => ((+x.createdAt || 0) - (+y.createdAt || 0)) || String(x.id).localeCompare(String(y.id)));
+    list.sort(byAge);
     let allowed = 0;
     for (const a of list) {
       if (!a.dayKey) { allowed++; continue; }                       // legacy: always counts, never denied
       if (allowed >= ACTIVE_LIMIT) next.add(a.id); else allowed++;
     }
+    // repeating limit: only ACTIVE (not paused) repeating alerts count; denied-by-active ones don't
+    let rep = 0;
+    for (const a of list) {
+      if (!isRep(a) || next.has(a.id)) continue;
+      if (!a.dayKey) { rep++; continue; }
+      if (rep >= REPEAT_LIMIT) next.add(a.id); else rep++;
+    }
   }
-  for (const id of next) if (!activeDenied.has(id)) log(`🚫 Active limit (${ACTIVE_LIMIT}) — alert ${id} ignored${ACTIVE_ENFORCE ? '' : ' (log only)'}`);
+  for (const id of next) if (!activeDenied.has(id)) log(`🚫 Active/repeating limit (${ACTIVE_LIMIT}/${REPEAT_LIMIT}) — alert ${id} ignored${ACTIVE_ENFORCE ? '' : ' (log only)'}`);
   activeDenied = next;
 }
 const dailyProfileCache = new Map();           // userId -> { pro, limited, email, at }
