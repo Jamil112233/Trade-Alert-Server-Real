@@ -1371,7 +1371,7 @@ function checkAlerts() {
       if (alert.enabled === false) continue; // paused by the user (repeating alerts only)
       if (serverStopped && alert.userEmail !== DEV_EMAIL) continue;
       if (alert.alertKind === 'indicator') continue; // EMA alerts → Section 12 (indicator engine)
-      if (alert.setup === true && !trialAllowed(alert)) continue;   // Trade Setup is a paid feature: pro / trial credit only (Section 10a4)
+      if (!trialAllowed(alert)) continue;   // daily creation limit + Trade Setup trial (Section 10a4) — plain alerts of normal users always pass
       // TRADE SETUP: while waiting for the ENTRY a candle-close setup is handled at the minute boundary; once the entry is
       // taken, take profit / stop loss are always plain price touches (no candle-close option), so they come through here.
       const setupLive = alert.setup === true && !!alert.setupEntered;
@@ -1631,7 +1631,7 @@ function checkCandleCloseAlerts(closedTfs) {
   const all       = Object.values(activeAlerts);
   const alertList = all.filter(a => a.candleClose && a.alertKind !== 'indicator' && closedTfs.includes(a.timeframe)
                                     && !(a.setup === true && a.setupEntered)   // entered setups: TP/SL are price touches (checkAlerts)
-                                    && !(a.setup === true && !trialAllowed(a)));   // paid feature: pro / trial credit only
+                                    && trialAllowed(a));   // daily limit / paid-feature trial (Section 10a4)
 
   log(`  checkCandleCloseAlerts: ${alertCountsText(all)}, ${alertList.length} match [${closedTfs.join(',')}]`);
   all.filter(a => a.candleClose && a.alertKind !== 'indicator').forEach(a =>
@@ -2179,6 +2179,7 @@ const trialUserChain = new Map();   // userId -> promise (one decision at a time
 
 /** May this paid-feature alert (indicator / trade setup) be monitored? */
 function trialAllowed(a) {
+  if (DAILY_ENFORCE && dailyDenied.has(a.id)) return false;       // over the daily creation limit (denied alerts are ignored, never deleted)
   if (!TRIAL_ENFORCE) return true;
   const f = trialFeatureOf(a);
   if (!f) return true;
@@ -2214,7 +2215,8 @@ async function trialReadUser(userId, featKey) {
   return {
     count:   Math.max(cnt, ids.length, legacyUsed ? 1 : 0),
     ids,
-    docEmail: (f.email && f.email.stringValue) || ''
+    docEmail: (f.email && f.email.stringValue) || '',
+    createdOnPro: !!(f.createdOnPro && f.createdOnPro.booleanValue)
   };
 }
 
@@ -2312,16 +2314,128 @@ async function trialDecide(alert, featKey) {
   warn(`🚫 ${feat.label} alert not allowed (${feat.limit}/${feat.limit} trial credits used${usage.count > u.count ? ' on this email' : ''}, not pro): user=${userId} alert=${alertId}${TRIAL_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
 }
 
+// ── DAILY ALERT CREATION LIMIT (free accounts created on Trade Alert Pro: 20 new alerts per local day) ─────────────
+// • Who: FREE accounts whose users/{uid} has createdOnPro:true (written by the Pro app at account creation).
+//   Beta accounts (no field) and Pro-plan accounts are never limited.
+// • Day: the app puts the user's LOCAL date on every new alert (dayKey, "YYYY-MM-DD"); the server counts per that date
+//   (a date more than 1 day away from the server's UTC date is ignored → falls back to the UTC date of createdAt).
+// • Counter: users_usage/{email}.daily = { day, count, ids[] } — survives account deletion; ids stop restarts re-counting.
+// • Every alert type counts, deleting does not refund. Only alerts created in the last 48 h are looked at.
+// • Over the limit → the alert is ignored (not monitored, never deleted). The app already stops it with a popup.
+// • Fail-OPEN: if anything cannot be read, the alert is monitored (a Firestore hiccup must never stop live users).
+// • DAILY_ALERT_LIMIT (env, default 20); DAILY_LIMIT_ENFORCE=0 → only logs "would be blocked".
+const DAILY_LIMIT   = Math.max(1, parseInt(process.env.DAILY_ALERT_LIMIT || '20', 10) || 20);
+const DAILY_ENFORCE = process.env.DAILY_LIMIT_ENFORCE !== '0';
+const DAILY_WINDOW_MS = 48 * 3600 * 1000;
+const dailyDenied = new Set();                 // alertIds over the limit
+const dailyProfileCache = new Map();           // userId -> { pro, limited, email, at }
+
+const utcDay = ms => new Date(ms).toISOString().slice(0, 10);
+
+function dailyDayKey(alert) {
+  let k = typeof alert.dayKey === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(alert.dayKey) ? alert.dayKey : null;
+  if (k && Math.abs(Date.parse(k + 'T00:00:00Z') - Date.parse(utcDay(Date.now()) + 'T00:00:00Z')) > 86400000) k = null;
+  return k || utcDay(parseInt(alert.createdAt, 10) || Date.now());
+}
+
+function dailyIsRecent(a) {
+  const c = parseInt(a.createdAt, 10) || 0;
+  return c > 0 && Date.now() - c <= DAILY_WINDOW_MS && !(a.setup === true && a.setupEntered);
+}
+
+async function dailyProfile(userId) {
+  const c = dailyProfileCache.get(userId);
+  if (c && Date.now() - c.at < (c.limited ? 300000 : 900000)) return c;
+  const pro = await readPlanPro(userId);
+  let limited = false, email = '';
+  if (!pro) {
+    const u = await trialReadUser(userId, 'indicator');
+    limited = !!u.createdOnPro;
+    if (limited) email = await trialEmailOf(userId, u.docEmail);
+  }
+  const prof = { pro, limited, email, at: Date.now() };
+  dailyProfileCache.set(userId, prof);
+  return prof;
+}
+
+async function dailyReadUsage(email) {
+  const token = await getAccessToken();
+  const doc = await fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}`,
+    { headers: { 'Authorization': `Bearer ${token}` } });
+  if (doc && doc.error && doc.error.code !== 404) throw new Error(doc.error.message || 'usage read failed');
+  const m = (doc && doc.fields && doc.fields.daily && doc.fields.daily.mapValue && doc.fields.daily.mapValue.fields) || {};
+  return {
+    day:   (m.day && m.day.stringValue) || '',
+    count: m.count && m.count.integerValue ? parseInt(m.count.integerValue, 10) : 0,
+    ids:   ((m.ids && m.ids.arrayValue && m.ids.arrayValue.values) || []).map(v => v.stringValue).filter(Boolean)
+  };
+}
+
+async function dailyWriteUsage(email, userId, day, count, ids) {
+  const token = await getAccessToken();
+  const res = await fetchJson(
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${TRIAL_USAGE_COLLECTION}/${encodeURIComponent(email)}?updateMask.fieldPaths=daily&updateMask.fieldPaths=email&updateMask.fieldPaths=lastUid`,
+    { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ fields: {
+        daily: { mapValue: { fields: {
+          day:   { stringValue: day },
+          count: { integerValue: String(count) },
+          ids:   { arrayValue: { values: ids.slice(-30).map(x => ({ stringValue: x })) } } } } },
+        email:   { stringValue: email },
+        lastUid: { stringValue: userId } } }) });
+  if (res && res.error) throw new Error(res.error.message || 'usage write failed');
+}
+
+/** 'skip' (not limited / not new) | 'ok' (counted) | 'denied' (over the limit). Throws on read errors (caller fails open). */
+async function dailyDecide(alert) {
+  if (!dailyIsRecent(alert) || !alert.userId) return 'skip';
+  const prof = await dailyProfile(alert.userId);
+  if (prof.pro || !prof.limited || !prof.email) return 'skip';
+  const day = dailyDayKey(alert);
+  const d = await dailyReadUsage(prof.email);
+  if (d.day > day) return 'skip';                                  // counter already moved on to a later day
+  if (d.day === day && d.ids.includes(alert.id)) return 'ok';      // already counted (server restart / edit)
+  const count = d.day === day ? d.count : 0;
+  const ids   = d.day === day ? d.ids   : [];
+  if (count >= DAILY_LIMIT) return 'denied';
+  const saved = await withVerifiedRetry(`Daily alert count (${alert.userId})`, async () => {
+    await dailyWriteUsage(prof.email, alert.userId, day, count + 1, [...ids, alert.id]);
+    const chk = await dailyReadUsage(prof.email);
+    return chk.day === day && chk.ids.includes(alert.id) && chk.count >= count + 1;
+  }, 3, 1000);
+  if (!saved) throw new Error(`could not confirm daily count for ${alert.userId}`);
+  log(`📅 Daily alerts ${count + 1}/${DAILY_LIMIT} (${day}) user=${alert.userId} alert=${alert.id}`);
+  return 'ok';
+}
+
+/** One decision per new alert: daily limit first (a blocked alert must NOT spend a trial credit), then the trial credit. */
+async function decideAlert(a, fk) {
+  let daily = 'skip';
+  try { daily = await dailyDecide(a); }
+  catch (e) { warn(`daily limit check failed — alert allowed (${e.message})`); }
+  if (daily === 'denied') {
+    warn(`🚫 Daily limit ${DAILY_LIMIT}/${DAILY_LIMIT} reached: user=${a.userId} alert=${a.id} (${a.pairSymbol})${DAILY_ENFORCE ? ' — ignored' : ' — NOT enforced'}`);
+    dailyDenied.add(a.id);
+    trialDecisions.set(a.id, { ok: false, pro: false });
+    return;
+  }
+  if (fk) await trialDecide(a, fk);
+  else trialDecisions.set(a.id, { ok: true, pro: false });
+}
+
 function trialSweep() {
   for (const id of trialDecisions.keys()) if (!activeAlerts[id]) trialDecisions.delete(id);   // forget removed alerts
+  for (const id of dailyDenied) if (!activeAlerts[id]) dailyDenied.delete(id);
   for (const a of Object.values(activeAlerts)) {
     const fk = trialFeatureOf(a);
-    if (!a || !fk || !a.userId || trialDecisions.has(a.id) || trialPending.has(a.id)) continue;
+    if (!a || !a.userId || trialDecisions.has(a.id) || trialPending.has(a.id)) continue;
+    if (!fk && !dailyIsRecent(a)) continue;                                      // old plain alert: nothing to decide
     if (fk === 'setup' && a.setupEntered) continue;                              // open trades are exempt (never need a decision)
     trialPending.add(a.id);
     const prev = trialUserChain.get(a.userId) || Promise.resolve();
-    const next = prev.then(() => trialDecide(a, fk))
-      .catch(e => warn(`trialDecide error (will retry): ${e.message}`))
+    const next = prev.then(() => decideAlert(a, fk))
+      .catch(e => warn(`decideAlert error (will retry): ${e.message}`))
       .finally(() => { trialPending.delete(a.id); if (trialUserChain.get(a.userId) === next) trialUserChain.delete(a.userId); });
     trialUserChain.set(a.userId, next);
   }
